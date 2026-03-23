@@ -74,6 +74,13 @@ public class NetworkTopologyRcaTool {
 				.map(String::trim)
 				.filter(s -> !s.isBlank())
 				.collect(Collectors.toList());
+		List<String> inputSeeds = List.copyOf(nodeIds);
+		List<String> resolvedNodeIds = graphTopologyService.resolveToNodeIds(inputSeeds, maxAlarmingNodeIds * 2);
+		if (!resolvedNodeIds.isEmpty()) {
+			nodeIds = new ArrayList<>(resolvedNodeIds);
+		}
+		log.info("[NetworkTopologyRca] Dynamic seed resolution: inputSeeds={} resolvedNodeIds={} sampleResolved={}",
+				inputSeeds.size(), nodeIds.size(), nodeIds.stream().limit(10).toList());
 
 		int mergedSize = nodeIds.size();
 		if (maxAlarmingNodeIds != Integer.MAX_VALUE && nodeIds.size() > maxAlarmingNodeIds) {

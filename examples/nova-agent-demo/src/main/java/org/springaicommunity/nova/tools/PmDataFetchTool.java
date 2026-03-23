@@ -1,10 +1,19 @@
 package org.springaicommunity.nova.tools;
 
-import java.time.Instant;
-import java.time.format.DateTimeFormatter;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+import javax.sql.DataSource;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,30 +60,63 @@ public class PmDataFetchTool {
             - Top busiest time periods
             - Pre-computed findings
 
-            Your job is to turn this into a clean, professional NOC performance report.
-            Write for a NOC manager who needs to act fast — be direct, precise, and jargon-appropriate.
+            You MUST follow the caller-provided "Response mode" exactly:
+            - REPORT: produce a clean, professional NOC performance report.
+            - CONVERSATIONAL: do NOT produce a formal report. Reply like a friendly senior NOC engineer in natural dialogue.
 
-            Rules:
+            For CONVERSATIONAL mode:
+            - Use plain spoken, operational language.
+            - Keep it very concise and action-oriented.
+            - STRICT: Respond in 1 to 2 sentences only.
+            - No formal report sections, no markdown tables, no "Executive Summary"/"Recommendations" headings.
+            - No long bullets or multi-section formatting.
+            - Include practical next checks an on-shift engineer can run immediately.
+
+            For REPORT mode:
+            - Structured report style is allowed.
+
+            Write for a NOC manager/engineer who needs to act fast — be direct, precise, and jargon-appropriate.
+
+            Rules (always):
             - Use only the values already in the summary — never invent numbers
             - Lead with the most critical issues
             - Explain what each anomaly means operationally, not just the numbers
-            - End with 3-5 concrete, prioritised actions with clear owners and timelines
-            - Keep the report concise — a NOC manager should read it in under 2 minutes
+            - End with concrete, prioritised actions
+            - Keep output concise
             """;
 
     private static final int MAX_RETRIES = 4;
+    private static final String DEFAULT_DOMAIN = "TRANSPORT";
+    private static final String DEFAULT_VENDOR = "JUNIPER";
+    private static final String DEFAULT_TECHNOLOGY = "COMMON";
+    private static final String DEFAULT_DATA_LEVEL = "ROUTER_COMMON_Router";
+    private static final String DEFAULT_GRANULARITY = "HOURLY";
+    private static final String DEFAULT_FROM = "2025-01-23T00:00:00Z";
+    private static final String DEFAULT_TO = "2025-01-23T10:59:59Z";
+    private static final String DATA_LEVEL_L0 = "L0_COMMON_Router";
+    private static final String DATA_LEVEL_L1 = "L1_COMMON_Router";
+    private static final String DATA_LEVEL_L2 = "L2_COMMON_Router";
+    private static final String DATA_LEVEL_L3 = "L3_COMMON_Router";
+    private static final Pattern MARKDOWN_BOLD = Pattern.compile("\\*\\*");
+    private static final Pattern MARKDOWN_CODE = Pattern.compile("`");
+    private static final Pattern BULLET_PREFIX = Pattern.compile("(?m)^\\s*[-*]\\s+");
+    private static final Pattern HEADING_PREFIX = Pattern.compile("(?m)^\\s*#{1,6}\\s*");
+    private static final Pattern SENTENCE_SPLIT = Pattern.compile("(?<=[.!?])\\s+");
 
     private final RestClient restClient;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final org.springaicommunity.nova.pm.analytics.PmAnalyticsEngine analyticsEngine;
     private final ChatClient analystClient;
+    private final DataSource dataSource;
 
     private PmDataFetchTool(String pmApiBaseUrl,
             org.springaicommunity.nova.pm.analytics.PmAnalyticsEngine analyticsEngine,
-            ChatClient.Builder builder) {
+            ChatClient.Builder builder,
+            DataSource dataSource) {
         this.restClient = RestClient.builder().baseUrl(pmApiBaseUrl).build();
         this.analyticsEngine = analyticsEngine;
         this.analystClient = builder.defaultSystem(ANALYST_SYSTEM_PROMPT).build();
+        this.dataSource = dataSource;
     }
 
     // @formatter:off
@@ -91,26 +133,29 @@ public class PmDataFetchTool {
             Parameters (all optional — blanks are filled with demo defaults so you can call this
             immediately for vague requests like "performance report"):
               domain       — default TRANSPORT
-              vendor       — default NOKIA
-              technology   — default NR
-              dataLevel    — default NODE
+              vendor       — default JUNIPER
+              technology   — default COMMON
+              dataLevel    — default ROUTER_COMMON_Router
               nodeName     — default "" (all nodes)
               granularity  — default HOURLY
-              from / to    — default last 24 hours UTC if omitted
+              from         — default 2025-01-23T00:00:00Z
+              to           — default 2025-01-23T10:59:59Z
             """)
     public String fetchEnrichedPmData( // @formatter:on
             @ToolParam(required = false, description = "Network domain — blank → TRANSPORT") String domain,
-            @ToolParam(required = false, description = "Vendor — blank → NOKIA") String vendor,
-            @ToolParam(required = false, description = "Technology — blank → NR") String technology,
-            @ToolParam(required = false, description = "Data level — blank → NODE") String dataLevel,
+            @ToolParam(required = false, description = "Vendor — blank → JUNIPER") String vendor,
+            @ToolParam(required = false, description = "Technology — blank → COMMON") String technology,
+            @ToolParam(required = false, description = "Data level — blank → ROUTER_COMMON_Router") String dataLevel,
             @ToolParam(required = false, description = "Node IP/hostname — blank → all nodes") String nodeName,
             @ToolParam(required = false, description = "HOURLY, DAILY, WEEKLY — blank → HOURLY") String granularity,
-            @ToolParam(required = false, description = "Start ISO-8601 UTC — blank → 24h ago") String from,
-            @ToolParam(required = false, description = "End ISO-8601 UTC — blank → now") String to) {
+            @ToolParam(required = false, description = "Start ISO-8601 UTC — blank → 2025-01-23T00:00:00Z") String from,
+            @ToolParam(required = false, description = "End ISO-8601 UTC — blank → 2025-01-23T10:59:59Z") String to,
+            @ToolParam(required = false, description = "Original user PM ask. Include this to control tone: only if user asked 'report' return formal report, else return conversational NOC guidance.") String userQuery) {
 
         AgentConsole.toolStarted("PmAnalysis");
         try {
-            ResolvedPmParams p = resolveParams(domain, vendor, technology, dataLevel, nodeName, granularity, from, to);
+            ResolvedPmParams p = resolveParams(domain, vendor, technology, dataLevel, nodeName, granularity, from, to,
+                    userQuery == null ? "" : userQuery.trim());
             domain = p.domain;
             vendor = p.vendor;
             technology = p.technology;
@@ -119,6 +164,11 @@ public class PmDataFetchTool {
             granularity = p.granularity;
             from = p.from;
             to = p.to;
+            String originalUserQuery = userQuery == null ? "" : userQuery.trim();
+            boolean reportRequested = isReportRequested(originalUserQuery);
+            List<String> requestedKpiTerms = extractRequestedKpiTerms(originalUserQuery);
+            Set<String> requestedKpiCodes = resolveKpiCodesForTerms(
+                    requestedKpiTerms, domain, vendor, technology);
 
             boolean singleNode = nodeName != null && !nodeName.isBlank();
 
@@ -138,6 +188,7 @@ public class PmDataFetchTool {
                         .queryParam("granularity", granularity)
                         .queryParam("from", from)
                         .queryParam("to", to)
+                        .queryParam("kpiCodes", requestedKpiCodes.toArray())
                         .build().toUriString();
                 log.info("Fetching PM data (single node): {}", url);
                 raw = restClient.get().uri(url).retrieve().body(String.class);
@@ -146,9 +197,10 @@ public class PmDataFetchTool {
             } else {
                 String body = String.format(
                         "{\"domain\":\"%s\",\"vendor\":\"%s\",\"technology\":\"%s\","
-                        + "\"dataLevel\":\"%s\",\"granularity\":\"%s\","
+                        + "\"dataLevel\":\"%s\",\"granularity\":\"%s\",\"kpiCodes\":%s,"
                         + "\"timeRange\":{\"from\":\"%s\",\"to\":\"%s\"}}",
-                        domain, vendor, technology, dataLevel, granularity, from, to);
+                        domain, vendor, technology, dataLevel, granularity,
+                        toJsonArray(requestedKpiCodes), from, to);
                 log.info("Fetching PM data (all nodes) via POST /pm/data/query/enriched");
                 raw = restClient.post()
                         .uri("/pm/data/query/enriched")
@@ -170,6 +222,12 @@ public class PmDataFetchTool {
                 return "[PmAnalysis] No PM data found for the given parameters.";
             }
 
+            if (!requestedKpiTerms.isEmpty() && requestedKpiCodes.isEmpty()) {
+                return "token_usage_total_estimated=0\nI couldn’t find KPI metadata matching your requested KPI scope. Please share the exact KPI name/code.";
+            }
+
+            raw = objectMapper.writeValueAsString(singleNode ? responses.get(0) : responses);
+
             // ── Step 2: Token-budget decision ─────────────────────────────────────
             // Estimate tokens using the standard GPT approximation (1 token ≈ 4 chars).
             // If the raw response fits within 100K tokens we send it verbatim so the LLM
@@ -180,6 +238,7 @@ public class PmDataFetchTool {
             String reportContext = String.format(
                     "Performance analysis for %s (%s/%s/%s), %s granularity, %s to %s",
                     contextNode, domain, vendor, technology, granularity, from, to);
+            String responseMode = reportRequested ? "REPORT" : "CONVERSATIONAL";
 
             final String prompt;
             if (estimatedTokens <= 100_000) {
@@ -187,12 +246,19 @@ public class PmDataFetchTool {
                         estimatedTokens);
                 prompt = String.format("""
                         Investigation context: %s
+                        User PM request: %s
+                        Response mode: %s
 
                         Full enriched PM data (JSON):
                         %s
 
-                        Generate the NOC performance report.
-                        """, reportContext, raw);
+                        If response mode is REPORT, generate a formal structured NOC report.
+                        If response mode is CONVERSATIONAL, respond like a friendly senior NOC engineer:
+                        - short actionable explanation
+                        - call out important KPI risks in plain operational language
+                        - suggest practical next checks/steps
+                        - avoid rigid report sections/headings unless explicitly asked
+                        """, reportContext, originalUserQuery.isBlank() ? "(not provided)" : originalUserQuery, responseMode, raw);
             } else {
                 // ── Step 2b: Run Java analytics engine on each node ───────────────
                 log.info("Raw response ~{} tokens exceeds 100K limit — running analytics engine to compress",
@@ -211,15 +277,27 @@ public class PmDataFetchTool {
                         summaryJson.length(), summaryJson.length() / 4);
                 prompt = String.format("""
                         Investigation context: %s
+                        User PM request: %s
+                        Response mode: %s
 
                         Pre-computed PM analytics summary (JSON):
                         %s
 
-                        Generate the NOC performance report.
-                        """, reportContext, summaryJson);
+                        If response mode is REPORT, generate a formal structured NOC report.
+                        If response mode is CONVERSATIONAL, respond like a friendly senior NOC engineer:
+                        - short actionable explanation
+                        - call out important KPI risks in plain operational language
+                        - suggest practical next checks/steps
+                        - avoid rigid report sections/headings unless explicitly asked
+                        """, reportContext, originalUserQuery.isBlank() ? "(not provided)" : originalUserQuery, responseMode, summaryJson);
             }
 
-            return callWithRetry(prompt);
+            String llmOutput = callWithRetry(prompt);
+            String finalBody = reportRequested ? llmOutput : forceConversationalTone(llmOutput);
+            int inputTokensEstimate = Math.max(1, prompt.length() / 4);
+            int outputTokensEstimate = Math.max(1, finalBody.length() / 4);
+            int totalTokensEstimate = inputTokensEstimate + outputTokensEstimate;
+            return "token_usage_total_estimated=" + totalTokensEstimate + "\n" + finalBody;
 
         } catch (Exception e) {
             log.error("PM analysis failed for node={} from={} to={}", nodeName, from, to, e);
@@ -267,26 +345,290 @@ public class PmDataFetchTool {
      * Fills blanks so the orchestrator model can call PmAnalysis with no arguments
      * for generic "show performance report" requests.
      */
-    private static ResolvedPmParams resolveParams(String domain, String vendor, String technology,
-            String dataLevel, String nodeName, String granularity, String from, String to) {
-        String d = blankToDefault(domain, "TRANSPORT");
-        String v = blankToDefault(vendor, "NOKIA");
-        String t = blankToDefault(technology, "NR");
-        String dl = blankToDefault(dataLevel, "NODE");
+    private ResolvedPmParams resolveParams(String domain, String vendor, String technology,
+            String dataLevel, String nodeName, String granularity, String from, String to, String userQuery) {
+        String d = blankToDefault(domain, DEFAULT_DOMAIN);
+        String v = blankToDefault(vendor, DEFAULT_VENDOR);
+        String t = blankToDefault(technology, DEFAULT_TECHNOLOGY);
+        String dl = blankToDefault(dataLevel, DEFAULT_DATA_LEVEL);
         String nn = nodeName != null ? nodeName.trim() : "";
-        String g = blankToDefault(granularity, "HOURLY").toUpperCase();
-        Instant now = Instant.now();
-        String fromIso = blankToDefault(from, DateTimeFormatter.ISO_INSTANT.format(now.minus(24, ChronoUnit.HOURS)));
-        String toIso = blankToDefault(to, DateTimeFormatter.ISO_INSTANT.format(now));
+        String g = blankToDefault(granularity, DEFAULT_GRANULARITY).toUpperCase();
+        String fromIso = blankToDefault(from, DEFAULT_FROM);
+        String toIso = blankToDefault(to, DEFAULT_TO);
+
+        ScopeResolution scope = resolveScopeFromUserQuery(userQuery);
+        if (isBlank(dataLevel) && scope.dataLevel != null) {
+            dl = scope.dataLevel;
+        }
+        if (isBlank(nodeName) && scope.nodeName != null && !scope.nodeName.isBlank()) {
+            nn = scope.nodeName;
+        }
+
+        if (!scope.reason.isBlank()) {
+            log.info("[PmAnalysis] Dynamic scope resolution: {}", scope.reason);
+        }
         return new ResolvedPmParams(d, v, t, dl, nn, g, fromIso, toIso);
+    }
+
+    private ScopeResolution resolveScopeFromUserQuery(String userQuery) {
+        if (userQuery == null || userQuery.isBlank() || this.dataSource == null) {
+            return ScopeResolution.empty();
+        }
+        String q = userQuery.toLowerCase(Locale.ROOT);
+        if (q.contains("pan")) {
+            String node = matchGeographyName(userQuery, "GEOGRAPHY_L0_NAME");
+            return new ScopeResolution(DATA_LEVEL_L0, node,
+                    "level=PAN -> dataLevel=" + DATA_LEVEL_L0 + ", nodeName=" + (node == null ? "" : node));
+        }
+        if (q.contains("region")) {
+            String node = matchGeographyName(userQuery, "GEOGRAPHY_L1_NAME");
+            return new ScopeResolution(DATA_LEVEL_L1, node,
+                    "level=REGION -> dataLevel=" + DATA_LEVEL_L1 + ", nodeName=" + (node == null ? "" : node));
+        }
+        if (q.contains("state")) {
+            String node = matchGeographyName(userQuery, "GEOGRAPHY_L2_NAME");
+            return new ScopeResolution(DATA_LEVEL_L2, node,
+                    "level=STATE -> dataLevel=" + DATA_LEVEL_L2 + ", nodeName=" + (node == null ? "" : node));
+        }
+        if (q.contains("city")) {
+            String node = matchGeographyName(userQuery, "GEOGRAPHY_L3_NAME");
+            return new ScopeResolution(DATA_LEVEL_L3, node,
+                    "level=CITY -> dataLevel=" + DATA_LEVEL_L3 + ", nodeName=" + (node == null ? "" : node));
+        }
+        return ScopeResolution.empty();
+    }
+
+    private String matchGeographyName(String userQuery, String columnName) {
+        if (isBlank(userQuery) || isBlank(columnName) || this.dataSource == null) {
+            return null;
+        }
+        List<String> names = fetchDistinctAlarmColumnValues(columnName, 5000);
+        if (names.isEmpty()) {
+            return null;
+        }
+        String q = userQuery.toLowerCase(Locale.ROOT);
+        String best = null;
+        for (String n : names) {
+            String name = n == null ? "" : n.trim();
+            if (name.isBlank()) continue;
+            String ln = name.toLowerCase(Locale.ROOT);
+            if (q.contains(ln)) {
+                if (best == null || name.length() > best.length()) {
+                    best = name;
+                }
+            }
+        }
+        return best;
+    }
+
+    private List<String> fetchDistinctAlarmColumnValues(String requestedColumn, int maxRows) {
+        if (this.dataSource == null) return List.of();
+        String actualColumn = resolveActualAlarmColumnName(requestedColumn);
+        if (actualColumn == null) {
+            log.warn("[PmAnalysis] Could not resolve ALARM column '{}'", requestedColumn);
+            return List.of();
+        }
+        String sql = "SELECT DISTINCT " + actualColumn + " FROM ALARM WHERE " + actualColumn
+                + " IS NOT NULL AND TRIM(" + actualColumn + ") <> '' LIMIT " + Math.max(1, maxRows);
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        try (Connection conn = dataSource.getConnection();
+                java.sql.Statement st = conn.createStatement();
+                ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                String v = rs.getString(1);
+                if (v != null && !v.isBlank()) out.add(v.trim());
+            }
+        }
+        catch (SQLException e) {
+            log.warn("[PmAnalysis] Failed geography lookup for column '{}': {}", actualColumn, e.getMessage());
+            return List.of();
+        }
+        return List.copyOf(out);
+    }
+
+    private String resolveActualAlarmColumnName(String requestedColumn) {
+        if (isBlank(requestedColumn) || this.dataSource == null) return null;
+        String wanted = requestedColumn.trim().toLowerCase(Locale.ROOT);
+        try (Connection conn = dataSource.getConnection()) {
+            DatabaseMetaData meta = conn.getMetaData();
+            String schema = conn.getSchema();
+            try (ResultSet rs = meta.getColumns(null, schema, "ALARM", "%")) {
+                while (rs.next()) {
+                    String col = rs.getString("COLUMN_NAME");
+                    if (col != null && col.trim().toLowerCase(Locale.ROOT).equals(wanted)) {
+                        return col;
+                    }
+                }
+            }
+        }
+        catch (SQLException e) {
+            log.warn("[PmAnalysis] Unable to inspect ALARM metadata: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    private static boolean isReportRequested(String userQuery) {
+        if (userQuery == null || userQuery.isBlank()) return false;
+        String q = userQuery.toLowerCase(Locale.ROOT);
+        return q.contains("report") || q.contains("summary report");
+    }
+
+    /**
+     * Enforces plain conversational style for non-report asks, even if the model returns
+     * markdown/report formatting.
+     */
+    private static String forceConversationalTone(String text) {
+        if (text == null || text.isBlank()) return text;
+        String out = text;
+        out = HEADING_PREFIX.matcher(out).replaceAll("");
+        out = MARKDOWN_BOLD.matcher(out).replaceAll("");
+        out = MARKDOWN_CODE.matcher(out).replaceAll("");
+        out = BULLET_PREFIX.matcher(out).replaceAll("- ");
+        out = out.replaceAll("(?m)^\\s*What to check next\\s*$", "Next checks:");
+        out = out.replaceAll("(?m)^\\s*Recommendations\\s*:?", "Next checks:");
+        out = out.replaceAll("\\n{3,}", "\n\n").trim();
+        return enforceMaxTwoSentences(out);
+    }
+
+    private static String enforceMaxTwoSentences(String text) {
+        String compact = text.replace('\n', ' ').replaceAll("\\s{2,}", " ").trim();
+        if (compact.isBlank()) return compact;
+
+        String[] parts = SENTENCE_SPLIT.split(compact);
+        StringBuilder sb = new StringBuilder();
+        int sentenceCount = 0;
+        for (String part : parts) {
+            String s = part == null ? "" : part.trim();
+            if (s.isBlank()) continue;
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(s);
+            sentenceCount++;
+            if (sentenceCount >= 2) break;
+        }
+
+        String result = sb.toString().trim();
+        if (!result.isBlank()) return result;
+        // Fallback when sentence boundaries are unclear.
+        return compact.length() <= 320 ? compact : compact.substring(0, 320).trim() + "...";
+    }
+
+    private static List<String> extractRequestedKpiTerms(String userQuery) {
+        if (userQuery == null || userQuery.isBlank()) return List.of();
+        String q = userQuery.toLowerCase(Locale.ROOT);
+        LinkedHashSet<String> terms = new LinkedHashSet<>();
+        if (!(q.contains("kpi") || q.contains("traffic") || q.contains("availability")
+                || q.contains("latency") || q.contains("loss") || q.contains("utilization")
+                || q.contains("throughput"))) {
+            return List.of();
+        }
+        if (q.contains("traffic")) {
+            terms.add("traffic");
+            terms.add("throughput");
+            terms.add("bandwidth");
+        }
+        if (q.contains("availability")) {
+            terms.add("availability");
+            terms.add("service drop");
+            terms.add("drop");
+            terms.add("uptime");
+        }
+        if (q.contains("latency")) {
+            terms.add("latency");
+            terms.add("delay");
+            terms.add("rtt");
+        }
+        if (q.contains("loss")) {
+            terms.add("loss");
+            terms.add("packet loss");
+            terms.add("discard");
+        }
+        if (q.contains("utilization")) {
+            terms.add("utilization");
+            terms.add("cpu");
+            terms.add("memory");
+        }
+        if (q.contains("throughput")) {
+            terms.add("throughput");
+        }
+        return List.copyOf(terms);
+    }
+
+    private static boolean matchesAnyTerm(String haystackLower, List<String> terms) {
+        if (haystackLower == null || terms == null || terms.isEmpty()) return false;
+        for (String term : terms) {
+            if (term != null && !term.isBlank() && haystackLower.contains(term.toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Set<String> resolveKpiCodesForTerms(List<String> terms, String domain, String vendor, String technology) {
+        if (terms == null || terms.isEmpty() || dataSource == null) return Set.of();
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        String sql = "SELECT DISTINCT KPI_CODE, KPI_NAME, DESCRIPTION, KPI_GROUP, FORMULA_COUNTER_INFO "
+                + "FROM KPI_FORMULA WHERE (DELETED = 0 OR DELETED IS NULL) "
+                + "AND UPPER(DOMAIN)=UPPER(?) AND UPPER(VENDOR)=UPPER(?) AND UPPER(TECHNOLOGY)=UPPER(?)";
+        try (Connection conn = dataSource.getConnection();
+                java.sql.PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, domain);
+            ps.setString(2, vendor);
+            ps.setString(3, technology);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String code = rs.getString("KPI_CODE");
+                    String haystack = (safe(rs.getString("KPI_NAME")) + " "
+                            + safe(rs.getString("DESCRIPTION")) + " "
+                            + safe(rs.getString("KPI_GROUP")) + " "
+                            + safe(rs.getString("FORMULA_COUNTER_INFO")) + " "
+                            + safe(code)).toLowerCase(Locale.ROOT);
+                    if (code != null && !code.isBlank() && matchesAnyTerm(haystack, terms)) {
+                        out.add(code.trim());
+                    }
+                }
+            }
+        }
+        catch (SQLException e) {
+            log.warn("[PmAnalysis] Failed KPI term resolution from KPI_FORMULA: {}", e.getMessage());
+        }
+        log.info("[PmAnalysis] KPI DB resolution terms={} matchedCodes={}", terms, out.size());
+        return Set.copyOf(out);
+    }
+
+    private static String toJsonArray(Set<String> values) {
+        if (values == null || values.isEmpty()) return "[]";
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        for (String v : values) {
+            if (v == null || v.isBlank()) continue;
+            if (!first) sb.append(",");
+            sb.append("\"").append(v.replace("\"", "\\\"")).append("\"");
+            first = false;
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static String safe(String s) {
+        return s == null ? "" : s;
     }
 
     private static String blankToDefault(String s, String def) {
         return (s == null || s.isBlank()) ? def : s.trim();
     }
 
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
+    }
+
     private record ResolvedPmParams(String domain, String vendor, String technology, String dataLevel,
             String nodeName, String granularity, String from, String to) {
+    }
+
+    private record ScopeResolution(String dataLevel, String nodeName, String reason) {
+        private static ScopeResolution empty() {
+            return new ScopeResolution(null, null, "");
+        }
     }
 
     public static Builder builder() {
@@ -298,6 +640,7 @@ public class PmDataFetchTool {
         private String pmApiBaseUrl = "http://localhost:8080";
         private org.springaicommunity.nova.pm.analytics.PmAnalyticsEngine analyticsEngine;
         private ChatClient.Builder chatClientBuilder;
+        private DataSource dataSource;
 
         public Builder pmApiBaseUrl(String pmApiBaseUrl) {
             Assert.hasText(pmApiBaseUrl, "pmApiBaseUrl must not be blank");
@@ -315,10 +658,15 @@ public class PmDataFetchTool {
             return this;
         }
 
+        public Builder dataSource(DataSource dataSource) {
+            this.dataSource = dataSource;
+            return this;
+        }
+
         public PmDataFetchTool build() {
             Assert.notNull(analyticsEngine, "analyticsEngine must not be null");
             Assert.notNull(chatClientBuilder, "chatClientBuilder must not be null");
-            return new PmDataFetchTool(pmApiBaseUrl, analyticsEngine, chatClientBuilder);
+            return new PmDataFetchTool(pmApiBaseUrl, analyticsEngine, chatClientBuilder, dataSource);
         }
     }
 }

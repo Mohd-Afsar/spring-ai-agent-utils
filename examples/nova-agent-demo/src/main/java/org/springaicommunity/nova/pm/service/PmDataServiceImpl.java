@@ -2,7 +2,9 @@ package org.springaicommunity.nova.pm.service;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
@@ -117,21 +119,17 @@ public class PmDataServiceImpl implements PmDataService {
         }
 
         List<PmDataResponse> responses = new ArrayList<>();
-
+        Map<String, List<PmRecord>> recordsByNode = fetchRecordsForNodes(tableName, request.getDomain(),
+                request.getVendor(), request.getTechnology(), effectiveDataLevel, nodeNames, from, to,
+                request.getPage(), request.getSize());
+        TimeRange timeRange = new TimeRange(from, to);
         for (String nodeName : nodeNames) {
-            List<PmRecord> records = fetchRecords(tableName, request.getDomain(),
-                    request.getVendor(), request.getTechnology(),
-                    effectiveDataLevel, nodeName, from, to,
-                    request.getPage(), request.getSize());
-
+            List<PmRecord> records = recordsByNode.getOrDefault(nodeName, List.of());
             boolean hasMore = records.size() == request.getSize();
-            TimeRange timeRange = new TimeRange(from, to);
-
             PmDataResponse response = mapper.toResponse(records, request.getDomain(),
                     request.getVendor(), request.getTechnology(), request.getGranularity(),
                     effectiveDataLevel, nodeName, timeRange,
                     request.getKpiCodes(), request.getPage(), request.getSize(), hasMore);
-
             responses.add(response);
         }
 
@@ -187,6 +185,46 @@ public class PmDataServiceImpl implements PmDataService {
         }
         int end = Math.min(skip + size, allRecords.size());
         return allRecords.subList(skip, end);
+    }
+
+    private Map<String, List<PmRecord>> fetchRecordsForNodes(String tableName, String domain, String vendor,
+            String technology, String dataLevel, List<String> nodeNames,
+            Instant from, Instant to, int page, int size) {
+        Map<String, List<PmRecord>> grouped = new LinkedHashMap<>();
+        if (nodeNames == null || nodeNames.isEmpty()) return grouped;
+        for (String node : nodeNames) {
+            grouped.put(node, new ArrayList<>());
+        }
+
+        List<String> dates = dateExpander.expand(from, to);
+        int skipPerNode = page * size;
+        int fetchPerNode = skipPerNode + size + 1;
+        int batchLimit = Math.max(1, fetchPerNode * Math.max(1, nodeNames.size()));
+
+        for (String date : dates) {
+            List<PmRecord> dateRecords = repository.findByPartitionAndTimeRangeForNodeNames(
+                    tableName, domain, vendor, technology, dataLevel, date, nodeNames, from, to, batchLimit);
+            for (PmRecord r : dateRecords) {
+                if (r == null || r.getKey() == null) continue;
+                String node = r.getKey().getNodeName();
+                List<PmRecord> bucket = grouped.get(node);
+                if (bucket != null && bucket.size() < fetchPerNode) {
+                    bucket.add(r);
+                }
+            }
+        }
+
+        Map<String, List<PmRecord>> paged = new LinkedHashMap<>();
+        for (Map.Entry<String, List<PmRecord>> e : grouped.entrySet()) {
+            List<PmRecord> records = e.getValue();
+            if (skipPerNode >= records.size()) {
+                paged.put(e.getKey(), List.of());
+                continue;
+            }
+            int end = Math.min(skipPerNode + size, records.size());
+            paged.put(e.getKey(), records.subList(skipPerNode, end));
+        }
+        return paged;
     }
 
 }

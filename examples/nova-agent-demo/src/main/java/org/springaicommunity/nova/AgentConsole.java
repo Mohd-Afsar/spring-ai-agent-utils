@@ -8,6 +8,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Shared console state and inter-tool data cache for the NOVA CLI.
@@ -35,6 +37,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * fine for a CLI tool. For a long-running server, add TTL expiry as needed.
  */
 public final class AgentConsole {
+	private static final Logger log = LoggerFactory.getLogger(AgentConsole.class);
 
 	/** Human-readable name of the tool currently running, or blank if none. */
 	public static final AtomicReference<String> currentTool = new AtomicReference<>("");
@@ -71,11 +74,16 @@ public final class AgentConsole {
 			synchronized (TURN_LOCK) {
 				turnToolCalls.add(toolName);
 			}
+			log.info("[NOVA][ToolTrace] toolStarted='{}'", toolName);
 		}
 	}
 
 	public static void toolFinished() {
+		String previous = currentTool.get();
 		currentTool.set("");
+		if (previous != null && !previous.isBlank()) {
+			log.info("[NOVA][ToolTrace] toolFinished='{}'", previous);
+		}
 	}
 
 	/** Clears per-turn tool history. Call before invoking NOVA for a request. */

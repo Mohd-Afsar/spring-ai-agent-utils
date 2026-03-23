@@ -1,6 +1,7 @@
 package org.springaicommunity.nova.pm.repository;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -88,6 +89,49 @@ public class PmDataRepository {
             .inTable(tableName)
             .matching(query)
             .all();
+    }
+
+    /**
+     * Retrieves PM records for multiple node names in a single Cassandra query using IN(nodename).
+     */
+    public List<PmRecord> findByPartitionAndTimeRangeForNodeNames(
+            String tableName,
+            String domain,
+            String vendor,
+            String technology,
+            String dataLevel,
+            String date,
+            List<String> nodeNames,
+            Instant from,
+            Instant to,
+            int limit) {
+
+        if (nodeNames == null || nodeNames.isEmpty()) {
+            return List.of();
+        }
+        List<String> cleaned = nodeNames.stream()
+                .filter(n -> n != null && !n.isBlank())
+                .distinct()
+                .toList();
+        if (cleaned.isEmpty()) {
+            return List.of();
+        }
+
+        Query query = Query.query(
+                Criteria.where("domain").is(domain),
+                Criteria.where("vendor").is(vendor),
+                Criteria.where("technology").is(technology),
+                Criteria.where("datalevel").is(dataLevel),
+                Criteria.where("date").is(date),
+                Criteria.where("nodename").in(new ArrayList<>(cleaned)),
+                Criteria.where("timestamp").gte(from),
+                Criteria.where("timestamp").lte(to))
+            .limit(limit);
+        log.info("Batch Query (nodes={}): {}", cleaned.size(), query);
+        return cassandraTemplate.query(PmRecord.class)
+                .inTable(tableName)
+                .matching(query)
+                .all();
     }
 
     /**

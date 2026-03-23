@@ -528,6 +528,47 @@ public class GraphTopologyService {
 	}
 
 	/**
+	 * Resolves free-form user seeds to canonical JanusGraph nodeId values.
+	 * Match order (exact): nodeId -> ipv4 -> name.
+	 */
+	public List<String> resolveToNodeIds(List<String> seeds, int maxResolved) {
+		if (seeds == null || seeds.isEmpty()) {
+			return List.of();
+		}
+		int cap = Math.max(1, maxResolved);
+		LinkedHashSet<String> resolved = new LinkedHashSet<>();
+		for (String raw : seeds) {
+			if (resolved.size() >= cap) break;
+			String seed = raw != null ? raw.trim() : "";
+			if (seed.isBlank()) continue;
+
+			List<String> byNodeId = g.V().has("nodeId", seed).limit(8).values("nodeId").toList().stream()
+					.map(Object::toString)
+					.toList();
+			if (!byNodeId.isEmpty()) {
+				resolved.addAll(byNodeId);
+				continue;
+			}
+
+			List<String> byIpv4 = g.V().has("ipv4", seed).limit(8).values("nodeId").toList().stream()
+					.map(Object::toString)
+					.toList();
+			if (!byIpv4.isEmpty()) {
+				resolved.addAll(byIpv4);
+				continue;
+			}
+
+			List<String> byName = g.V().has("name", seed).limit(8).values("nodeId").toList().stream()
+					.map(Object::toString)
+					.toList();
+			if (!byName.isEmpty()) {
+				resolved.addAll(byName);
+			}
+		}
+		return resolved.stream().limit(cap).toList();
+	}
+
+	/**
 	 * Runs a minimal traversal that should succeed if Gremlin + JanusGraph are reachable.
 	 * This avoids noisy per-node WARN logs when the graph DB is down.
 	 */
