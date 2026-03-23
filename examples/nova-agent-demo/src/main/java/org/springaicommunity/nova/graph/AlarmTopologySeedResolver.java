@@ -41,26 +41,26 @@ public final class AlarmTopologySeedResolver {
 		if (normalizedHeader == null || normalizedHeader.isEmpty()) {
 			return false;
 		}
+		// Avoid broad substrings like "entity" (matches ENTITY_ID / ENTITY_TYPE) or "host" (matches unrelated columns).
 		return normalizedHeader.contains("entityname")
-				|| normalizedHeader.contains("entity")
+				|| normalizedHeader.equals("entityid")
 				|| normalizedHeader.contains("nodename")
 				|| normalizedHeader.contains("nodeid")
 				|| normalizedHeader.contains("nename")
 				|| normalizedHeader.contains("hostname")
-				|| normalizedHeader.contains("host")
+				|| normalizedHeader.contains("senderhostname")
 				|| normalizedHeader.contains("objectname")
 				|| normalizedHeader.contains("alarmsource")
 				|| normalizedHeader.contains("subentity")
 				|| normalizedHeader.contains("location")
 				|| normalizedHeader.contains("sitename")
-				|| normalizedHeader.contains("site")
 				|| normalizedHeader.contains("interface")
 				|| normalizedHeader.contains("ifname")
 				|| normalizedHeader.contains("portname")
 				|| normalizedHeader.contains("ipaddress")
 				|| normalizedHeader.contains("ipaddr")
 				|| normalizedHeader.contains("neip")
-				|| normalizedHeader.endsWith("ip");
+				|| (normalizedHeader.endsWith("ipv4") || normalizedHeader.endsWith("ipaddress"));
 	}
 
 	/**
@@ -85,6 +85,11 @@ public final class AlarmTopologySeedResolver {
 		// Typical NE_TYPE / category column values — not hostnames
 		if (u.equals("ROUTER") || u.equals("SWITCH") || u.equals("DWDM") || u.equals("INTERFACE")
 				|| u.equals("SERVER") || u.equals("FIREWALL")) {
+			return false;
+		}
+		// Topology layer / category tokens from alarm dimension columns — not NE identifiers.
+		if (u.equals("ACCESS") || u.equals("AGGREGATION") || u.equals("CORE") || u.equals("TRANSPORT")
+				|| u.equals("RAN") || u.equals("BACKHAUL")) {
 			return false;
 		}
 		if (JUNK_TOPOLOGY_BLOB.matcher(t).find()) {
@@ -124,7 +129,10 @@ public final class AlarmTopologySeedResolver {
 	/**
 	 * Collect distinct non-empty cell values from every column whose header looks topology-relevant.
 	 */
-	public static List<String> extractSeedsFromAlarmMarkdown(String markdownTable) {
+	/**
+	 * @param maxDistinctSeeds cap on distinct seeds; {@code <= 0} means unlimited.
+	 */
+	public static List<String> extractSeedsFromAlarmMarkdown(String markdownTable, int maxDistinctSeeds) {
 		if (markdownTable == null || markdownTable.isBlank()) {
 			return List.of();
 		}
@@ -172,7 +180,7 @@ public final class AlarmTopologySeedResolver {
 					continue;
 				}
 				distinct.add(value);
-				if (distinct.size() >= MAX_SEEDS_FROM_MARKDOWN) {
+				if (maxDistinctSeeds > 0 && distinct.size() >= maxDistinctSeeds) {
 					return List.copyOf(distinct);
 				}
 			}
@@ -180,14 +188,20 @@ public final class AlarmTopologySeedResolver {
 		return List.copyOf(distinct);
 	}
 
+	/** Backward-compatible default cap ({@value MAX_SEEDS_FROM_MARKDOWN} seeds). */
+	public static List<String> extractSeedsFromAlarmMarkdown(String markdownTable) {
+		return extractSeedsFromAlarmMarkdown(markdownTable, MAX_SEEDS_FROM_MARKDOWN);
+	}
+
 	/**
 	 * Map free-text alarm seeds to {@code NETWORK_ELEMENT.NE_NAME} rows (same string as Janus {@code nodeId}).
 	 */
 	public static List<String> resolveSeedsToNeNames(DataSource dataSource, Collection<String> seeds, int maxResults)
 			throws SQLException {
-		if (dataSource == null || seeds == null || seeds.isEmpty() || maxResults <= 0) {
+		if (dataSource == null || seeds == null || seeds.isEmpty()) {
 			return List.of();
 		}
+		int cap = maxResults <= 0 ? Integer.MAX_VALUE : maxResults;
 		List<String> clean = new ArrayList<>();
 		for (String s : seeds) {
 			if (s == null) {
@@ -208,43 +222,73 @@ public final class AlarmTopologySeedResolver {
 			return List.of();
 		}
 		LinkedHashSet<String> out = new LinkedHashSet<>();
-		for (int i = 0; i < clean.size() && out.size() < maxResults; i += MAX_IN_CLAUSE) {
+		for (int i = 0; i < clean.size() && out.size() < cap; i += MAX_IN_CLAUSE) {
 			int end = Math.min(i + MAX_IN_CLAUSE, clean.size());
 			List<String> batch = clean.subList(i, end);
-			resolveBatch(dataSource, batch, out, maxResults);
+			resolveBatch(dataSource, batch, out, cap);
 		}
-		fuzzyResolveRemaining(dataSource, clean, out, 40, maxResults);
+		fuzzyResolveRemaining(dataSource, clean, out, 40, cap);
 		return List.copyOf(out);
 	}
 
+	/**
+	 * Resolves seeds using <b>exact</b> {@code NE_NAME} and (for IPv4-shaped seeds only) {@code IPV4}.
+	 * We intentionally avoid {@code HOST_NAME IN (...)} / {@code FRIENDLY_NAME IN (...)} here: short or
+	 * generic values can match huge numbers of inventory rows and explode to tens of thousands of NE_NAMEs,
+	 * stalling JanusGraph topology generation.
+	 */
 	private static void resolveBatch(DataSource dataSource, List<String> batch, LinkedHashSet<String> out, int maxResults)
 			throws SQLException {
-		if (batch.isEmpty()) {
+		if (batch.isEmpty() || out.size() >= maxResults) {
 			return;
 		}
-		StringBuilder ph = new StringBuilder();
+		List<String> ipLit = new ArrayList<>();
+		for (String s : batch) {
+			if (s != null && IPV4.matcher(s.trim()).matches()) {
+				ipLit.add(s.trim());
+			}
+		}
+		StringBuilder phAll = new StringBuilder();
 		for (int k = 0; k < batch.size(); k++) {
 			if (k > 0) {
-				ph.append(",");
+				phAll.append(",");
 			}
-			ph.append("?");
+			phAll.append("?");
 		}
-		String in = ph.toString();
-		String sql = """
-				SELECT DISTINCT NE_NAME FROM NETWORK_ELEMENT
-				WHERE IFNULL(IS_DELETED, 0) = 0
-				  AND NE_NAME IS NOT NULL AND TRIM(NE_NAME) <> ''
-				  AND (
-				    NE_NAME IN (%s) OR HOST_NAME IN (%s) OR FRIENDLY_NAME IN (%s) OR IPV4 IN (%s)
-				  )
-				""".formatted(in, in, in, in);
+		String inAll = phAll.toString();
+		String sql;
+		if (ipLit.isEmpty()) {
+			sql = """
+					SELECT DISTINCT NE_NAME FROM NETWORK_ELEMENT
+					WHERE IFNULL(IS_DELETED, 0) = 0
+					  AND NE_NAME IS NOT NULL AND TRIM(NE_NAME) <> ''
+					  AND NE_NAME IN (%s)
+					""".formatted(inAll);
+		}
+		else {
+			StringBuilder phIp = new StringBuilder();
+			for (int k = 0; k < ipLit.size(); k++) {
+				if (k > 0) {
+					phIp.append(",");
+				}
+				phIp.append("?");
+			}
+			String inIp = phIp.toString();
+			sql = """
+					SELECT DISTINCT NE_NAME FROM NETWORK_ELEMENT
+					WHERE IFNULL(IS_DELETED, 0) = 0
+					  AND NE_NAME IS NOT NULL AND TRIM(NE_NAME) <> ''
+					  AND (NE_NAME IN (%s) OR IPV4 IN (%s))
+					""".formatted(inAll, inIp);
+		}
 		try (Connection c = dataSource.getConnection();
 				PreparedStatement ps = c.prepareStatement(sql)) {
 			int p = 1;
-			for (int pass = 0; pass < 4; pass++) {
-				for (String s : batch) {
-					ps.setString(p++, s);
-				}
+			for (String s : batch) {
+				ps.setString(p++, s);
+			}
+			for (String s : ipLit) {
+				ps.setString(p++, s);
 			}
 			try (ResultSet rs = ps.executeQuery()) {
 				while (rs.next() && out.size() < maxResults) {

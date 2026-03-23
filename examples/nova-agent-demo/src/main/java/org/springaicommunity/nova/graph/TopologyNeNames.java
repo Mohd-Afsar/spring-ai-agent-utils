@@ -14,7 +14,7 @@ public final class TopologyNeNames {
 	 * Underscore followed by typical Juniper-style interface / pseudo-interface tokens in synced NE_NAMEs.
 	 */
 	private static final Pattern INTERFACE_NE_SUFFIX = Pattern.compile(
-			"_(?:ge-|fxp|lo|lt-|gr-|em|irb|dsc|lsi(?:\\.|_)|gre|tap|mtun|pimd|pime|ipip|vlan|re-|mt-|ae\\d)");
+			"_(?:ge-|xe-|et-|fxp|lo|lt-|gr-|em|irb|dsc|lsi(?:\\.|_)|gre|tap|mtun|pimd|pime|ipip|vlan|re-|mt-|ae\\d)");
 
 	private TopologyNeNames() {
 	}
@@ -38,9 +38,10 @@ public final class TopologyNeNames {
 	 * Distinct parent equipment names, insertion order preserved, capped at {@code max}.
 	 */
 	public static List<String> distinctParentEquipment(Iterable<String> nodeIds, int max) {
-		if (nodeIds == null || max <= 0) {
+		if (nodeIds == null) {
 			return List.of();
 		}
+		boolean unlimited = max <= 0;
 		LinkedHashSet<String> out = new LinkedHashSet<>();
 		for (String id : nodeIds) {
 			if (id == null) {
@@ -50,7 +51,7 @@ public final class TopologyNeNames {
 			if (p != null && !p.isEmpty()) {
 				out.add(p);
 			}
-			if (out.size() >= max) {
+			if (!unlimited && out.size() >= max) {
 				break;
 			}
 		}

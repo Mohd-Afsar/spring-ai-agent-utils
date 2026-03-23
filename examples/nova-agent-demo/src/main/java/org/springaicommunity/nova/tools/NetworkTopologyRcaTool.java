@@ -27,6 +27,9 @@ public class NetworkTopologyRcaTool {
 
 	private static final Logger log = LoggerFactory.getLogger(NetworkTopologyRcaTool.class);
 
+	/** First N characters of JanusGraph-derived payloads logged at INFO for operator visibility. */
+	private static final int JANUS_TO_LLM_LOG_PREVIEW_CHARS = 2500;
+
 	private final GraphTopologyService graphTopologyService;
 	private final NetworkIntelligenceTool networkIntelligenceTool;
 	private final DataSource dataSource;
@@ -34,18 +37,26 @@ public class NetworkTopologyRcaTool {
 	private final int maxChildrenPerNodeInReport;
 	private final int maxLinkNeighborsPerNode;
 	private final int maxTopologyCharsForNetworkIntel;
+	/**
+	 * When true, {@code ENTITY_NAME} values that look like {@code Router_xe-0/0/0_…} collapse to the parent
+	 * equipment NE for one graph section per router. When false, every distinct alarming {@code NE_NAME} is queried
+	 * (e.g. all 345 open-alarm entities).
+	 */
+	private final boolean rollUpInterfaceAlarmsToParentEquipment;
 
 	public NetworkTopologyRcaTool(GraphTopologyService graphTopologyService, NetworkIntelligenceTool networkIntelligenceTool,
 			DataSource dataSource,
 			int maxAlarmingNodeIds, int maxChildrenPerNodeInReport, int maxLinkNeighborsPerNode,
-			int maxTopologyCharsForNetworkIntel) {
+			int maxTopologyCharsForNetworkIntel, boolean rollUpInterfaceAlarmsToParentEquipment) {
 		this.graphTopologyService = graphTopologyService;
 		this.networkIntelligenceTool = networkIntelligenceTool;
 		this.dataSource = dataSource;
-		this.maxAlarmingNodeIds = Math.max(1, maxAlarmingNodeIds);
-		this.maxChildrenPerNodeInReport = Math.max(1, maxChildrenPerNodeInReport);
-		this.maxLinkNeighborsPerNode = Math.max(1, maxLinkNeighborsPerNode);
+		// 0 or negative = unlimited (no truncation; Gremlin traversals omit .limit()).
+		this.maxAlarmingNodeIds = maxAlarmingNodeIds <= 0 ? Integer.MAX_VALUE : maxAlarmingNodeIds;
+		this.maxChildrenPerNodeInReport = maxChildrenPerNodeInReport <= 0 ? Integer.MAX_VALUE : maxChildrenPerNodeInReport;
+		this.maxLinkNeighborsPerNode = maxLinkNeighborsPerNode <= 0 ? Integer.MAX_VALUE : maxLinkNeighborsPerNode;
 		this.maxTopologyCharsForNetworkIntel = maxTopologyCharsForNetworkIntel;
+		this.rollUpInterfaceAlarmsToParentEquipment = rollUpInterfaceAlarmsToParentEquipment;
 	}
 
 	// @formatter:off
@@ -65,7 +76,7 @@ public class NetworkTopologyRcaTool {
 				.collect(Collectors.toList());
 
 		int mergedSize = nodeIds.size();
-		if (nodeIds.size() > maxAlarmingNodeIds) {
+		if (maxAlarmingNodeIds != Integer.MAX_VALUE && nodeIds.size() > maxAlarmingNodeIds) {
 			nodeIds = new ArrayList<>(nodeIds.subList(0, maxAlarmingNodeIds));
 			log.warn("[NetworkTopologyRca] Truncating alarming node IDs. originalCount={} truncatedCount={} (cap nova.topology.max-alarming-nodes={})",
 					mergedSize, nodeIds.size(), maxAlarmingNodeIds);
@@ -77,7 +88,8 @@ public class NetworkTopologyRcaTool {
 			return "[NetworkTopologyRca] No valid node IDs provided.";
 		}
 
-		return runTopologyPipeline(nodeIds, mergedSize, afterCapCount, investigationContext, List.of(), List.of());
+		return runTopologyPipeline(nodeIds, mergedSize, afterCapCount, investigationContext, List.of(), List.of(), true,
+				false, 0);
 	}
 
 	/**
@@ -85,37 +97,60 @@ public class NetworkTopologyRcaTool {
 	 * {@code NETWORK_ELEMENT.NE_NAME}, merge with literal values, then build the same graph report.
 	 */
 	public String analyzeTopologyForAlarmMarkdown(String alarmQueryMarkdown, String investigationContext) {
-		List<String> seeds = AlarmTopologySeedResolver.extractSeedsFromAlarmMarkdown(alarmQueryMarkdown);
+		return analyzeTopologyForAlarmMarkdown(alarmQueryMarkdown, investigationContext, true);
+	}
+
+	/**
+	 * @param runNetworkIntelligence when {@code false}, skip the extra NetworkIntelligence LLM pass (saves tokens).
+	 */
+	public String analyzeTopologyForAlarmMarkdown(String alarmQueryMarkdown, String investigationContext,
+			boolean runNetworkIntelligence) {
+		int seedExtractCap = maxAlarmingNodeIds == Integer.MAX_VALUE ? Integer.MAX_VALUE : maxAlarmingNodeIds * 8;
+		int resolveCap = maxAlarmingNodeIds == Integer.MAX_VALUE ? Integer.MAX_VALUE : maxAlarmingNodeIds * 4;
+		int graphCap = maxAlarmingNodeIds == Integer.MAX_VALUE ? Integer.MAX_VALUE : maxAlarmingNodeIds;
+		List<String> seeds = AlarmTopologySeedResolver.extractSeedsFromAlarmMarkdown(alarmQueryMarkdown, seedExtractCap);
 		List<String> resolved = List.of();
 		if (dataSource != null && !seeds.isEmpty()) {
 			try {
-				resolved = AlarmTopologySeedResolver.resolveSeedsToNeNames(dataSource, seeds, maxAlarmingNodeIds * 2);
+				resolved = AlarmTopologySeedResolver.resolveSeedsToNeNames(dataSource, seeds, resolveCap);
+				if (resolved.size() >= resolveCap) {
+					log.warn("[NetworkTopologyRca] MySQL NE_NAME resolution hit cap {} (distinct seeds={}). "
+							+ "Raise nova.topology.max-alarming-nodes or lower alarm row volume; cap scales with table rows.",
+							resolveCap, seeds.size());
+				}
 			}
 			catch (SQLException e) {
 				log.warn("[NetworkTopologyRca] MySQL seed resolution failed: {}", e.getMessage());
 			}
 		}
-		LinkedHashSet<String> merged = new LinkedHashSet<>(resolved);
+		LinkedHashSet<String> full = new LinkedHashSet<>();
+		for (String r : resolved) {
+			if (r != null && !r.isBlank()) {
+				full.add(r.trim());
+			}
+		}
 		for (String s : seeds) {
-			if (merged.size() >= maxAlarmingNodeIds) {
+			if (s != null && !s.isBlank()) {
+				full.add(s.trim());
+			}
+		}
+		int fullDistinct = full.size();
+		List<String> nodeIds = new ArrayList<>();
+		for (String x : full) {
+			if (nodeIds.size() >= graphCap) {
 				break;
 			}
-			if (s != null && !s.isBlank()) {
-				merged.add(s.trim());
-			}
+			nodeIds.add(x);
 		}
-		List<String> nodeIds = new ArrayList<>(merged);
-		int mergedSize = nodeIds.size();
-		if (nodeIds.size() > maxAlarmingNodeIds) {
-			nodeIds = new ArrayList<>(nodeIds.subList(0, maxAlarmingNodeIds));
-		}
-		int afterCapCount = nodeIds.size();
-		log.info("[NetworkTopologyRca] Alarm-markdown path: seeds={} resolvedToNeName={} graphLookups={}",
-				seeds.size(), resolved.size(), afterCapCount);
+		int neAtEntry = nodeIds.size();
+		boolean hitResolveCap = resolved.size() >= resolveCap;
+		log.info("[NetworkTopologyRca] Alarm-markdown path: seeds={} resolvedToNeName={} distinctMerged={} graphLookups={} resolveCap={}",
+				seeds.size(), resolved.size(), fullDistinct, neAtEntry, resolveCap);
 		if (nodeIds.isEmpty()) {
 			return "[NetworkTopologyRca] No topology seeds extracted from alarm markdown (need | table| columns like ENTITY_NAME, HOSTNAME, INTERFACE, IP, …).";
 		}
-		return runTopologyPipeline(nodeIds, mergedSize, afterCapCount, investigationContext, seeds, resolved);
+		return runTopologyPipeline(nodeIds, fullDistinct, neAtEntry, investigationContext, seeds, resolved,
+				runNetworkIntelligence, hitResolveCap, resolveCap);
 	}
 
 	private void logInvocation(List<String> nodeIds, String investigationContext) {
@@ -128,7 +163,8 @@ public class NetworkTopologyRcaTool {
 				nodeIds.size(), nodeIdSample, ctx);
 	}
 
-	private static String buildLlmRcaProlog(List<String> seeds, List<String> resolved, List<String> nodeIdsUsed) {
+	private static String buildLlmRcaProlog(List<String> seeds, List<String> resolved, List<String> nodeIdsUsed,
+			boolean hitMysqlResolveCap, int mysqlResolveCap) {
 		StringBuilder sb = new StringBuilder();
 		sb.append("## RCA — how to use topology + alarms\n\n");
 		sb.append("1. Cross-check **alarm entity / object / interface / IP** with the sections below.\n");
@@ -139,6 +175,10 @@ public class NetworkTopologyRcaTool {
 		sb.append("- **Seeds** parsed from alarm markdown columns: ").append(seeds.size()).append(" distinct.\n");
 		sb.append("- **Resolved** to `NETWORK_ELEMENT.NE_NAME` (Janus `nodeId`): ").append(resolved.size()).append(".\n");
 		sb.append("- **NEs queried in graph**: ").append(nodeIdsUsed.size()).append(".\n");
+		if (hitMysqlResolveCap && mysqlResolveCap > 0) {
+			sb.append("- **Note:** MySQL resolution returned at least **").append(mysqlResolveCap)
+					.append("** distinct NE_NAME (cap). Some seeds may be unmapped in the graph sections.\n");
+		}
 		int lim = Math.min(20, seeds.size());
 		if (lim > 0) {
 			sb.append("- Sample seeds: ");
@@ -161,44 +201,79 @@ public class NetworkTopologyRcaTool {
 		return sb.toString();
 	}
 
-	private String runTopologyPipeline(List<String> nodeIds, int mergedSize, int afterCapCount,
-			String investigationContext, List<String> prologSeeds, List<String> prologResolved) {
+	private String runTopologyPipeline(List<String> nodeIds, int distinctOrPreTruncBound, int neCountAtPipelineEntry,
+			String investigationContext, List<String> prologSeeds, List<String> prologResolved,
+			boolean runNetworkIntelligence, boolean hitMysqlResolveCap, int mysqlResolveCap) {
 		AgentConsole.toolStarted("NetworkTopologyRca");
 		try {
 			AgentConsole.markJanusGraphEvidenceCalled();
 			int beforeEquipmentRollup = nodeIds.size();
-			List<String> equipmentIds = TopologyNeNames.distinctParentEquipment(nodeIds, maxAlarmingNodeIds);
-			if (!equipmentIds.isEmpty()) {
-				if (equipmentIds.size() < beforeEquipmentRollup) {
-					log.info("[NetworkTopologyRca] Equipment rollup for report: {} -> {} NE_NAME(s)",
-							beforeEquipmentRollup, equipmentIds.size());
+			if (rollUpInterfaceAlarmsToParentEquipment) {
+				int equipCap = maxAlarmingNodeIds == Integer.MAX_VALUE ? 0 : maxAlarmingNodeIds;
+				List<String> equipmentIds = TopologyNeNames.distinctParentEquipment(nodeIds, equipCap);
+				if (!equipmentIds.isEmpty()) {
+					if (equipmentIds.size() < beforeEquipmentRollup) {
+						log.info("[NetworkTopologyRca] Equipment rollup for report: {} -> {} NE_NAME(s)",
+								beforeEquipmentRollup, equipmentIds.size());
+					}
+					nodeIds = new ArrayList<>(equipmentIds);
 				}
-				nodeIds = new ArrayList<>(equipmentIds);
+			}
+			else {
+				log.info("[NetworkTopologyRca] Equipment rollup disabled — reporting {} distinct alarming NE_NAME(s) as-is",
+						nodeIds.size());
 			}
 			String llmProlog = null;
 			if (prologSeeds != null && !prologSeeds.isEmpty()) {
-				llmProlog = buildLlmRcaProlog(prologSeeds, prologResolved != null ? prologResolved : List.of(), nodeIds);
+				llmProlog = buildLlmRcaProlog(prologSeeds, prologResolved != null ? prologResolved : List.of(), nodeIds,
+						hitMysqlResolveCap, mysqlResolveCap);
 			}
-			String structure = graphTopologyService.formatInventoryTopologyReport(
+			String inventoryMarkdown = graphTopologyService.formatInventoryTopologyReport(
 					nodeIds, maxChildrenPerNodeInReport, maxLinkNeighborsPerNode);
-			String topologyReport = prependContext(structure, investigationContext, nodeIds, mergedSize, afterCapCount,
-					llmProlog);
+			String topologyJson = graphTopologyService.formatAlarmTopologySubgraphJson(
+					nodeIds, maxChildrenPerNodeInReport, maxLinkNeighborsPerNode);
+			String jsonFence = "\n\n### Alarm-focused topology (JSON)\n\n```json\n" + topologyJson + "\n```\n";
+			String structure = inventoryMarkdown + jsonFence;
+			String topologyReport = prependContext(structure, investigationContext, nodeIds, distinctOrPreTruncBound,
+					neCountAtPipelineEntry, llmProlog, rollUpInterfaceAlarmsToParentEquipment);
 
-			if (this.networkIntelligenceTool != null) {
+			log.info("[JanusGraph→LLM] Topology sections — inventoryMarkdownChars={}, subgraphJsonChars={}, "
+							+ "structureChars={}, fullToolPayloadChars={} (prolog/context/footer included)",
+					inventoryMarkdown.length(), topologyJson.length(), structure.length(), topologyReport.length());
+			log.info("[JanusGraph→LLM] Topology tool payload preview (first {} of {} chars):\n{}",
+					Math.min(JANUS_TO_LLM_LOG_PREVIEW_CHARS, topologyReport.length()),
+					topologyReport.length(),
+					truncForLog(topologyReport, JANUS_TO_LLM_LOG_PREVIEW_CHARS));
+
+			if (this.networkIntelligenceTool != null && runNetworkIntelligence) {
 				boolean niSizeOk = maxTopologyCharsForNetworkIntel <= 0
 						|| topologyReport.length() <= maxTopologyCharsForNetworkIntel;
 				if (!niSizeOk) {
 					log.warn("[NetworkTopologyRca] Skipping NetworkIntelligence due to large topology report chars={} (cap={})",
 							topologyReport.length(), maxTopologyCharsForNetworkIntel);
-					return topologyReport
-							+ "\n\n---\n\n"
+					String skippedNi = topologyReport + "\n\n---\n\n"
 							+ "_NetworkIntelligence skipped (payload too large)._";
+					log.info("[JanusGraph→LLM] Final tool return (NI skipped) totalChars={}", skippedNi.length());
+					log.info("[JanusGraph→LLM] Final tool return preview:\n{}", truncForLog(skippedNi, JANUS_TO_LLM_LOG_PREVIEW_CHARS));
+					return skippedNi;
 				}
+				log.info("[JanusGraph→LLM] Passing topologyReport to NetworkIntelligence LLM — chars={}",
+						topologyReport.length());
 				String networkIntelligence = this.networkIntelligenceTool.analyzeNetworkIntelligence(
 						topologyReport,
 						investigationContext,
 						investigationContext);
-				return topologyReport + "\n\n---\n\n" + networkIntelligence;
+				String combined = topologyReport + "\n\n---\n\n" + networkIntelligence;
+				log.info("[JanusGraph→LLM] Final tool return — totalChars={} (topologyChars={}, networkIntelligenceChars={})",
+						combined.length(), topologyReport.length(), networkIntelligence.length());
+				log.info("[JanusGraph→LLM] Final tool return preview (first {} of {} chars):\n{}",
+						Math.min(JANUS_TO_LLM_LOG_PREVIEW_CHARS, combined.length()),
+						combined.length(),
+						truncForLog(combined, JANUS_TO_LLM_LOG_PREVIEW_CHARS));
+				return combined;
+			}
+			if (!runNetworkIntelligence && this.networkIntelligenceTool != null) {
+				return topologyReport + "\n\n---\n\n_NetworkIntelligence skipped on this path (runNetworkIntelligence=false)._";
 			}
 			return topologyReport;
 		}
@@ -211,20 +286,34 @@ public class NetworkTopologyRcaTool {
 		}
 	}
 
-	private String prependContext(String body, String investigationContext, List<String> nodeIds, int mergedSize,
-			int afterCapCount, String llmProlog) {
+	private static String truncForLog(String s, int maxChars) {
+		if (s == null || s.isEmpty()) {
+			return "";
+		}
+		if (s.length() <= maxChars) {
+			return s;
+		}
+		return s.substring(0, maxChars) + "\n... [+" + (s.length() - maxChars) + " chars omitted]";
+	}
+
+	private String prependContext(String body, String investigationContext, List<String> nodeIds,
+			int distinctOrPreTruncBound, int neCountAtPipelineEntry, String llmProlog, boolean rolledUpToEquipment) {
 		String ctx = investigationContext != null ? investigationContext : "";
 		StringBuilder head = new StringBuilder();
 		if (llmProlog != null && !llmProlog.isBlank()) {
 			head.append(llmProlog);
 		}
 		head.append("**Investigation context:** ").append(ctx.isBlank() ? "_(none)_" : ctx).append("\n\n");
-		head.append("**Topology report scope:** ").append(nodeIds.size()).append(" unique equipment NE(s)");
-		if (afterCapCount > nodeIds.size()) {
-			head.append(" _(rolled up from ").append(afterCapCount).append(" inventory `NE_NAME` rows)_");
+		head.append("**Topology report scope:** ").append(nodeIds.size());
+		head.append(rolledUpToEquipment ? " unique equipment NE(s)" : " unique alarming NE_NAME(s) (no parent rollup)");
+		if (rolledUpToEquipment && neCountAtPipelineEntry > nodeIds.size()) {
+			head.append(" _(equipment rollup: ").append(neCountAtPipelineEntry).append(" alarming NE/interface → ")
+					.append(nodeIds.size()).append(" parent equipment NE(s))_");
 		}
-		if (mergedSize > afterCapCount) {
-			head.append(" _(cap: first ").append(afterCapCount).append(" of ").append(mergedSize).append(" resolved)_");
+		if (distinctOrPreTruncBound > neCountAtPipelineEntry) {
+			head.append(" _(graph NE list: first ").append(neCountAtPipelineEntry).append(" of ")
+					.append(distinctOrPreTruncBound).append(" distinct merged seeds / NE_NAME — raise ")
+					.append("`nova.topology.max-alarming-nodes` if you need a wider cap)_");
 		}
 		head.append(" | sample: ");
 		head.append(String.join(", ", nodeIds.stream().limit(12).toList()));
@@ -234,26 +323,34 @@ public class NetworkTopologyRcaTool {
 		head.append("\n\n");
 		head.append(body);
 		head.append("\n\n---\n");
-		head.append("_Use **PmDataFetch** on hot NEs for KPIs._\n");
+		head.append("_**PmDataFetch** is only for optional KPI time-series — it is **not** called by this tool. ")
+				.append("The text **PM** inside interface / circuit `neName` values is a **link description**, not Performance Management._\n");
 		return head.toString();
 	}
 
 	public static NetworkTopologyRcaTool of(GraphTopologyService service, ChatClient.Builder chatClientBuilder) {
-		return of(service, chatClientBuilder, 120, 30, 25, 100_000, null);
+		return of(service, chatClientBuilder, 0, 0, 0, 100_000, null, true);
 	}
 
 	public static NetworkTopologyRcaTool of(GraphTopologyService service, ChatClient.Builder chatClientBuilder,
 			int maxAlarmingNodeIds, int maxChildrenPerNode, int maxLinkNeighbors, int maxTopologyCharsForNetworkIntel) {
 		return of(service, chatClientBuilder, maxAlarmingNodeIds, maxChildrenPerNode, maxLinkNeighbors,
-				maxTopologyCharsForNetworkIntel, null);
+				maxTopologyCharsForNetworkIntel, null, true);
 	}
 
 	public static NetworkTopologyRcaTool of(GraphTopologyService service, ChatClient.Builder chatClientBuilder,
 			int maxAlarmingNodeIds, int maxChildrenPerNode, int maxLinkNeighbors, int maxTopologyCharsForNetworkIntel,
 			DataSource dataSource) {
+		return of(service, chatClientBuilder, maxAlarmingNodeIds, maxChildrenPerNode, maxLinkNeighbors,
+				maxTopologyCharsForNetworkIntel, dataSource, true);
+	}
+
+	public static NetworkTopologyRcaTool of(GraphTopologyService service, ChatClient.Builder chatClientBuilder,
+			int maxAlarmingNodeIds, int maxChildrenPerNode, int maxLinkNeighbors, int maxTopologyCharsForNetworkIntel,
+			DataSource dataSource, boolean rollUpInterfaceAlarmsToParentEquipment) {
 		NetworkIntelligenceTool networkIntelligence = NetworkIntelligenceTool.builder(chatClientBuilder).build();
 		return new NetworkTopologyRcaTool(service, networkIntelligence, dataSource, maxAlarmingNodeIds, maxChildrenPerNode,
-				maxLinkNeighbors, maxTopologyCharsForNetworkIntel);
+				maxLinkNeighbors, maxTopologyCharsForNetworkIntel, rollUpInterfaceAlarmsToParentEquipment);
 	}
 
 }

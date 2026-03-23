@@ -1,12 +1,19 @@
 package org.springaicommunity.nova.graph;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import org.apache.tinkerpop.gremlin.process.traversal.P;
+import org.apache.tinkerpop.gremlin.process.traversal.TextP;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversal;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.__;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.stereotype.Service;
 
@@ -68,7 +75,66 @@ public class GraphTopologyService {
 	/** Sibling-alarm ratio above this → SHARED_RESOURCE pattern. */
 	private static final double SHARED_RESOURCE_SIBLING_RATIO = 0.60;
 
+	/**
+	 * {@code <= 0} = unlimited (use with care on large graphs).
+	 * @see #capJsonSubgraphVertices()
+	 */
+	@Value("${nova.topology.max-json-subgraph-vertices:0}")
+	private int maxJsonSubgraphVerticesProp;
+
+	@Value("${nova.topology.max-json-descendants-per-seed:0}")
+	private int maxJsonDescendantsPerSeedProp;
+
+	@Value("${nova.topology.max-inventory-report-nodes:0}")
+	private int maxInventoryReportNodesProp;
+
+	/**
+	 * When {@code PARENT_OF} equipment→interface edges are missing in Janus but interface vertices still use
+	 * {@code nodeId} = {@code NE_NAME} with the usual {@code {equipment}_{interface…}} pattern, discover those
+	 * interfaces via {@code TextP.startingWith(equipment + "_")} so OSPF {@code CONNECTED_TO} and neighbors appear.
+	 */
+	@Value("${nova.topology.prefix-fallback-for-interface-vertices:true}")
+	private boolean prefixFallbackForInterfaceVertices;
+
+	@Value("${nova.topology.prefix-fallback-interfaces-per-equipment:100}")
+	private int prefixFallbackInterfacesPerEquipment;
+
+	/**
+	 * When {@code max-children-per-node} / {@code max-link-neighbors-per-node} are {@code 0} (unlimited), Gremlin
+	 * fan-out per NE can take minutes (hundreds of interfaces × OSPF walks). These soft caps keep alarm reports fast.
+	 * Set to {@code 0} for truly unlimited (slow on large routers).
+	 */
+	@Value("${nova.topology.soft-cap-children-per-node-when-unlimited:0}")
+	private int softCapChildrenWhenUnlimited;
+
+	@Value("${nova.topology.soft-cap-neighbors-per-node-when-unlimited:0}")
+	private int softCapNeighborsWhenUnlimited;
+
+	/** Per equipment NE: only first N interface rows get indented OSPF peer lines (each line = 1 Gremlin round-trip). 0 = all. */
+	@Value("${nova.topology.inventory-max-interfaces-for-ospf-peer-lines:12}")
+	private int inventoryMaxInterfacesForOspfPeerLines;
+
+	/**
+	 * Cap how many interface {@code nodeId}s feed the <b>batched</b> neighbor query (0 = use all listed children — still
+	 * one Gremlin batch per chunk, not one query per interface).
+	 */
+	@Value("${nova.topology.inventory-max-interfaces-for-neighbor-walk:0}")
+	private int inventoryMaxInterfacesForNeighborWalk;
+
+	/**
+	 * {@code minimal} — inventory markdown: NE id, parent chain, interface {@code nodeId}s, 1-hop neighbor equipment only;
+	 * alarm JSON vertices: {@code nodeId} + {@code neType} only. {@code full} — verbose markdown + rich JSON (vendor, geo, …).
+	 */
+	@Value("${nova.topology.topology-output-style:minimal}")
+	private String topologyOutputStyle;
+
 	private final GraphTraversalSource g;
+
+	private boolean compactTopologyOutput() {
+		return !"full".equalsIgnoreCase(topologyOutputStyle != null ? topologyOutputStyle.trim() : "");
+	}
+
+	private final ObjectMapper objectMapper;
 
 	/**
 	 * Performs a one-time lightweight JanusGraph / Gremlin reachability check
@@ -78,9 +144,170 @@ public class GraphTopologyService {
 
 	private volatile boolean janusGraphHealthy = false;
 
-	public GraphTopologyService(GraphTraversalSource g) {
+	public GraphTopologyService(GraphTraversalSource g, ObjectProvider<ObjectMapper> objectMapperProvider) {
 		this.g = g;
+		ObjectMapper base = objectMapperProvider.getIfAvailable();
+		if (base == null) {
+			log.warn("[GraphTopologyService] No ObjectMapper bean from Spring context — using standalone instance for alarm topology JSON");
+			base = new ObjectMapper();
+		}
+		this.objectMapper = base.copy()
+				.enable(SerializationFeature.INDENT_OUTPUT)
+				.setDefaultPropertyInclusion(JsonInclude.Value.construct(JsonInclude.Include.ALWAYS,
+						JsonInclude.Include.ALWAYS));
 	}
+
+	/** {@code <= 0} property → effectively unlimited vertex budget for alarm JSON / closure. */
+	private int capJsonSubgraphVertices() {
+		return maxJsonSubgraphVerticesProp <= 0 ? Integer.MAX_VALUE : maxJsonSubgraphVerticesProp;
+	}
+
+	private int capJsonDescendantsPerSeed() {
+		return maxJsonDescendantsPerSeedProp <= 0 ? Integer.MAX_VALUE : maxJsonDescendantsPerSeedProp;
+	}
+
+	private int capInventoryReportNodes() {
+		return maxInventoryReportNodesProp <= 0 ? Integer.MAX_VALUE : maxInventoryReportNodesProp;
+	}
+
+	/**
+	 * Tool passes {@link Integer#MAX_VALUE} for “unlimited”; positive values are used as Gremlin list caps.
+	 */
+	private static int effectivePerNodeCap(int maxChildrenOrNeighbors) {
+		if (maxChildrenOrNeighbors <= 0 || maxChildrenOrNeighbors >= Integer.MAX_VALUE / 4) {
+			return Integer.MAX_VALUE;
+		}
+		return Math.max(1, maxChildrenOrNeighbors);
+	}
+
+	/** Applies {@link #softCapChildrenWhenUnlimited} / {@link #softCapNeighborsWhenUnlimited} when config is "unlimited". */
+	private int resolveInventoryFanoutCap(int configuredMax, int softWhenUnlimited) {
+		if (configuredMax > 0 && configuredMax < Integer.MAX_VALUE / 4) {
+			return configuredMax;
+		}
+		if (softWhenUnlimited > 0 && softWhenUnlimited < Integer.MAX_VALUE / 4) {
+			return softWhenUnlimited;
+		}
+		return Integer.MAX_VALUE;
+	}
+
+	/** Omit Gremlin {@code .limit} when the cap is effectively unlimited (avoids Integer overflow / driver quirks). */
+	private static <S, E> GraphTraversal<S, E> optionalLongLimit(GraphTraversal<S, E> t, int max) {
+		if (max <= 0 || max >= Integer.MAX_VALUE / 4) {
+			return t;
+		}
+		return t.limit((long) max);
+	}
+
+	private static String buildHierarchyHumanReadable(List<Map<String, Object>> edgesJson) {
+		if (edgesJson == null || edgesJson.isEmpty()) {
+			return "";
+		}
+		StringBuilder hb = new StringBuilder();
+		for (Map<String, Object> e : edgesJson) {
+			String label = Objects.toString(e.get("label"), "");
+			String from = Objects.toString(e.get("from"), "");
+			String to = Objects.toString(e.get("to"), "");
+			if (from.isBlank() || to.isBlank()) {
+				continue;
+			}
+			if ("PARENT_OF".equals(label)) {
+				hb.append("PARENT_OF (inventory parent→child): `").append(from).append("` → `").append(to).append("`");
+				if (Boolean.TRUE.equals(e.get("inferredFromNeName"))) {
+					hb.append(" _(inferred from composite NE_NAME)_");
+				}
+				hb.append("\n");
+			}
+			else if ("CONNECTED_TO".equals(label)) {
+				hb.append("CONNECTED_TO (OSPF link): `").append(from).append("` ↔ `").append(to).append("`\n");
+			}
+			else {
+				hb.append(label).append(": `").append(from).append("` — `").append(to).append("`\n");
+			}
+		}
+		return hb.toString();
+	}
+
+	private void appendConnectivityAmongNodesMarkdown(StringBuilder sb, List<String> nodeIds) {
+		if (nodeIds == null || nodeIds.isEmpty()) {
+			return;
+		}
+		List<Map<String, Object>> edges = fetchIncidentEdgesJson(new ArrayList<>(nodeIds), false);
+		sb.append("\n---\n\n## Who connects to whom (edges incident to listed NEs)\n\n");
+		sb.append("_Rows include **PARENT_OF** and **CONNECTED_TO** where at least one end is a listed NE; the other end may be an interface or peer not duplicated above._\n\n");
+		if (edges.isEmpty()) {
+			sb.append("_No **PARENT_OF** or **CONNECTED_TO** edges (and no composite `nodeId` parent prefix could be inferred). Check `NETWORK_ELEMENT.PARENT_NE_ID_FK`, `OSPF_LINK`, and Janus sync._\n\n");
+			return;
+		}
+		sb.append("| Edge | From | To |\n| --- | --- | --- |\n");
+		for (Map<String, Object> e : edges) {
+			String label = Objects.toString(e.get("label"), "");
+			String from = Objects.toString(e.get("from"), "");
+			String to = Objects.toString(e.get("to"), "");
+			sb.append("| ").append(label).append(" | `").append(from).append("` | `").append(to).append("` |\n");
+		}
+		sb.append("\n");
+	}
+
+	/**
+	 * Expands the vertex set so incident **PARENT_OF** / **CONNECTED_TO** endpoints are more likely to be present
+	 * for correlation; {@link #fetchIncidentEdgesJson} still lists edges with one endpoint outside the subgraph.
+	 */
+	private LinkedHashSet<String> closeSubgraphUnderIncidentEdges(LinkedHashSet<String> subgraph) {
+		int cap = capJsonSubgraphVertices();
+		if (subgraph == null || subgraph.isEmpty()) {
+			return subgraph == null ? new LinkedHashSet<>() : subgraph;
+		}
+		LinkedHashSet<String> closed = new LinkedHashSet<>(subgraph);
+		final int chunk = 400;
+		final int maxClosureRounds = 12;
+		boolean changed = true;
+		int round = 0;
+		while (changed && closed.size() < cap && round < maxClosureRounds) {
+			round++;
+			changed = false;
+			List<String> batch = new ArrayList<>(closed);
+			for (int i = 0; i < batch.size() && closed.size() < cap; i += chunk) {
+				List<String> part = batch.subList(i, Math.min(i + chunk, batch.size()));
+				Set<String> neighbors = new HashSet<>();
+				try {
+					g.V().has("nodeId", P.within(part)).outE("PARENT_OF").inV().values("nodeId")
+							.forEachRemaining(id -> neighbors.add(Objects.toString(id, "")));
+					g.V().has("nodeId", P.within(part)).inE("PARENT_OF").outV().values("nodeId")
+							.forEachRemaining(id -> neighbors.add(Objects.toString(id, "")));
+					g.V().has("nodeId", P.within(part)).bothE("CONNECTED_TO").otherV().values("nodeId")
+							.forEachRemaining(id -> neighbors.add(Objects.toString(id, "")));
+				}
+				catch (Exception ex) {
+					log.debug("[JanusGraph] closeSubgraph chunk failed: {}", ex.getMessage());
+				}
+				for (String nid : neighbors) {
+					if (nid == null || nid.isBlank()) {
+						continue;
+					}
+					nid = nid.trim();
+					if (closed.size() >= cap) {
+						break;
+					}
+					if (closed.add(nid)) {
+						changed = true;
+					}
+				}
+			}
+		}
+		if (round >= maxClosureRounds && changed) {
+			log.warn("[JanusGraph] Subgraph edge-closure stopped after {} rounds (vertexBudget={}, currentSize={})",
+					maxClosureRounds, cap, closed.size());
+		}
+		return closed;
+	}
+
+	/** Above this seed count, use chunked Gremlin instead of one traversal per seed (avoids 10+ minute stalls). */
+	private static final int ALARM_EXPAND_GREMLIN_CHUNK = 56;
+
+	/** Skip wide OSPF walk when intermediate vertex set is huge (each call is a full Gremlin traversal). */
+	/** Skip OSPF peer expansion only on very large snapshots (prefix-discovered interfaces can push this past hundreds). */
+	private static final int MAX_VERTICES_FOR_OSPF_EXPANSION = 5000;
 
 	/**
 	 * Projects standard inventory fields into plain String / Number values only.
@@ -105,8 +332,86 @@ public class GraphTopologyService {
 				.by(__.coalesce(__.values("alarmCount"), __.constant(0L)));
 	}
 
+	/**
+	 * Extended projection for JSON export — includes optional geo/POP fields when present on vertices.
+	 */
+	private GraphTraversal<?, Map<String, Object>> withJsonVertexProjection(GraphTraversal<?, Vertex> traversal) {
+		return traversal
+				.project("nodeId", "name", "neType", "vendor", "popName", "geographyL2Name", "domain", "technology",
+						"ipv4")
+				.by(__.coalesce(__.values("nodeId"), __.constant("")))
+				.by(__.coalesce(__.values("name"), __.constant("")))
+				.by(__.coalesce(__.values("neType"), __.constant("")))
+				.by(__.coalesce(__.values("vendor"), __.constant("")))
+				.by(__.coalesce(__.values("popName"), __.constant("")))
+				.by(__.coalesce(__.values("geographyL2Name"), __.constant("")))
+				.by(__.coalesce(__.values("domain"), __.constant("")))
+				.by(__.coalesce(__.values("technology"), __.constant("")))
+				.by(__.coalesce(__.values("ipv4"), __.constant("")));
+	}
+
 	private boolean vertexExistsByNodeId(String nodeId) {
 		return g.V().has("nodeId", nodeId).limit(1).values("nodeId").tryNext().isPresent();
+	}
+
+	private long countOutParentOfEdges(String nodeId) {
+		try {
+			return g.V().has("nodeId", nodeId).out("PARENT_OF").count().tryNext().orElse(0L);
+		}
+		catch (Exception e) {
+			log.debug("[JanusGraph] countOutParentOfEdges for {}: {}", nodeId, e.getMessage());
+			return 0L;
+		}
+	}
+
+	/**
+	 * Interface / logical children whose {@code nodeId} starts with {@code equipmentNodeId + "_"} (inventory naming).
+	 */
+	private List<String> listInterfaceNodeIdsByEquipmentPrefix(String equipmentNodeId, int maxResults) {
+		if (!prefixFallbackForInterfaceVertices || equipmentNodeId == null || equipmentNodeId.isBlank()) {
+			return List.of();
+		}
+		String prefix = equipmentNodeId + "_";
+		boolean unlimited = maxResults <= 0 || maxResults >= Integer.MAX_VALUE / 8;
+		try {
+			GraphTraversal<?, String> t = g.V().has("nodeId", TextP.startingWith(prefix)).values("nodeId");
+			if (!unlimited) {
+				t = t.limit((long) maxResults);
+			}
+			List<String> out = new ArrayList<>();
+			t.forEachRemaining(id -> {
+				String s = Objects.toString(id, "").trim();
+				if (!s.isEmpty() && !s.equals(equipmentNodeId)) {
+					out.add(s);
+				}
+			});
+			return out;
+		}
+		catch (Exception e) {
+			log.debug("[JanusGraph] listInterfaceNodeIdsByEquipmentPrefix prefix='{}': {}", prefix, e.getMessage());
+			return List.of();
+		}
+	}
+
+	private void addInterfaceVerticesByEquipmentPrefixIntoSubgraph(LinkedHashSet<String> acc, String equipmentSeed,
+			int perSeedLimit, int vCap) {
+		if (!prefixFallbackForInterfaceVertices || acc.size() >= vCap) {
+			return;
+		}
+		for (String iface : listInterfaceNodeIdsByEquipmentPrefix(equipmentSeed, perSeedLimit)) {
+			if (acc.size() >= vCap) {
+				break;
+			}
+			addToSubgraph(acc, iface);
+		}
+	}
+
+	private int effectivePrefixFallbackLimit(int maxChildrenScan) {
+		int cap = prefixFallbackInterfacesPerEquipment > 0 ? prefixFallbackInterfacesPerEquipment : 100;
+		if (maxChildrenScan > 0 && maxChildrenScan < Integer.MAX_VALUE / 8) {
+			return Math.min(cap, maxChildrenScan);
+		}
+		return cap;
 	}
 
 	// -------------------------------------------------------------------------
@@ -754,9 +1059,6 @@ public class GraphTopologyService {
 	// Inventory topology report (hierarchy + transport links, not RCA narrative)
 	// -------------------------------------------------------------------------
 
-	/** Must be >= {@code nova.topology.max-alarming-nodes} so the tool is not capped here first. */
-	private static final int MAX_NODES_IN_INVENTORY_TOPOLOGY_REPORT = 256;
-
 	/**
 	 * Markdown report: for each alarming NE, show attributes, parent chain (walk {@code in("PARENT_OF")}),
 	 * sample children ({@code out("PARENT_OF")}), and sample link neighbors ({@code both("CONNECTED_TO")}).
@@ -772,14 +1074,15 @@ public class GraphTopologyService {
 	 */
 	private List<Map<String, Object>> adjacentEquipmentViaOspfInterfaces(String nodeId, int limit) {
 		try {
-			int lim = Math.max(1, limit);
+			boolean unlimited = limit <= 0 || limit >= Integer.MAX_VALUE / 4;
+			int lim = unlimited ? Integer.MAX_VALUE : Math.max(1, limit);
+			var union = g.V().has("nodeId", nodeId)
+					.union(
+							__.out("PARENT_OF").both("CONNECTED_TO").dedup().in("PARENT_OF"),
+							__.both("CONNECTED_TO").in("PARENT_OF"))
+					.dedup();
 			List<Map<String, Object>> raw = withPlainTopologyProjection(
-					g.V().has("nodeId", nodeId)
-							.union(
-									__.out("PARENT_OF").both("CONNECTED_TO").dedup().in("PARENT_OF"),
-									__.both("CONNECTED_TO").in("PARENT_OF"))
-							.dedup()
-							.limit(lim * 3L))
+					unlimited ? union : union.limit(Math.min(500_000L, (long) lim * 3L)))
 					.toList();
 			List<Map<String, Object>> out = new ArrayList<>();
 			for (Map<String, Object> m : raw) {
@@ -787,7 +1090,7 @@ public class GraphTopologyService {
 					continue;
 				}
 				out.add(m);
-				if (out.size() >= lim) {
+				if (!unlimited && out.size() >= lim) {
 					break;
 				}
 			}
@@ -799,6 +1102,69 @@ public class GraphTopologyService {
 		}
 	}
 
+	/**
+	 * Peer <b>equipment</b> reachable from the listed interface children via {@code CONNECTED_TO} → peer interface →
+	 * {@code in("PARENT_OF")}. Uses <b>batched</b> Gremlin ({@code P.within}) so all listed interfaces are considered in
+	 * a few round-trips instead of one heavy traversal per interface.
+	 */
+	private List<Map<String, Object>> adjacentEquipmentAggregatedFromInterfaceChildren(String equipmentNodeId,
+			List<Map<String, Object>> interfaceChildren, int limit, int maxInterfaceIdsToInclude) {
+		if (interfaceChildren == null || interfaceChildren.isEmpty()) {
+			return List.of();
+		}
+		List<String> ifaceIds = new ArrayList<>();
+		for (Map<String, Object> c : interfaceChildren) {
+			String ifaceId = str(c, "nodeId");
+			if (ifaceId.isBlank() || "UNKNOWN".equalsIgnoreCase(ifaceId)) {
+				continue;
+			}
+			ifaceIds.add(ifaceId);
+			if (maxInterfaceIdsToInclude > 0 && ifaceIds.size() >= maxInterfaceIdsToInclude) {
+				break;
+			}
+		}
+		if (ifaceIds.isEmpty()) {
+			return List.of();
+		}
+		return adjacentEquipmentFromInterfacesBatch(ifaceIds, equipmentNodeId, limit);
+	}
+
+	private static final int ADJ_BATCH_WITHIN = 72;
+
+	private List<Map<String, Object>> adjacentEquipmentFromInterfacesBatch(List<String> interfaceNodeIds,
+			String excludeEquipmentNodeId, int maxResults) {
+		boolean unlimited = maxResults <= 0 || maxResults >= Integer.MAX_VALUE / 8;
+		Map<String, Map<String, Object>> byEq = new LinkedHashMap<>();
+		for (int i = 0; i < interfaceNodeIds.size() && (unlimited || byEq.size() < maxResults); i += ADJ_BATCH_WITHIN) {
+			List<String> chunk = interfaceNodeIds.subList(i, Math.min(i + ADJ_BATCH_WITHIN, interfaceNodeIds.size()));
+			try {
+				var trav = g.V().has("nodeId", P.within(chunk))
+						.both("CONNECTED_TO")
+						.dedup()
+						.in("PARENT_OF")
+						.dedup();
+				if (!unlimited) {
+					trav = trav.limit(Math.min(8_000L, (long) maxResults * 25L));
+				}
+				List<Map<String, Object>> rows = withPlainTopologyProjection(trav).toList();
+				for (Map<String, Object> m : rows) {
+					String pid = str(m, "nodeId");
+					if (pid.isBlank() || pid.equals(excludeEquipmentNodeId)) {
+						continue;
+					}
+					byEq.putIfAbsent(pid, m);
+					if (!unlimited && byEq.size() >= maxResults) {
+						break;
+					}
+				}
+			}
+			catch (Exception e) {
+				log.debug("[JanusGraph] adjacentEquipmentFromInterfacesBatch chunk={}: {}", chunk.size(), e.getMessage());
+			}
+		}
+		return List.copyOf(byEq.values());
+	}
+
 	public String formatInventoryTopologyReport(List<String> nodeIds, int maxChildrenPerNode, int maxNeighborsPerNode) {
 		ensureJanusGraphHealth();
 		if (!janusGraphHealthy) {
@@ -807,39 +1173,628 @@ public class GraphTopologyService {
 		if (nodeIds == null || nodeIds.isEmpty()) {
 			return "## Network topology (inventory)\n\nNo nodes to resolve.";
 		}
-		List<String> distinct = nodeIds.stream()
+		long invCap = capInventoryReportNodes();
+		var nodeStream = nodeIds.stream()
 				.filter(Objects::nonNull)
 				.map(String::trim)
 				.filter(s -> !s.isEmpty())
-				.distinct()
-				.limit(MAX_NODES_IN_INVENTORY_TOPOLOGY_REPORT)
-				.toList();
-		int maxCh = Math.max(1, Math.min(maxChildrenPerNode, 200));
-		int maxNbr = Math.max(1, Math.min(maxNeighborsPerNode, 200));
+				.distinct();
+		List<String> distinct = (invCap >= Integer.MAX_VALUE - 1)
+				? nodeStream.toList()
+				: nodeStream.limit(invCap).toList();
+		int maxCh = resolveInventoryFanoutCap(maxChildrenPerNode, softCapChildrenWhenUnlimited);
+		int maxNbr = resolveInventoryFanoutCap(maxNeighborsPerNode, softCapNeighborsWhenUnlimited);
 		StringBuilder sb = new StringBuilder();
-		sb.append("## Network topology (inventory)\n\n");
-		sb.append("""
-				_**PARENT_OF** — MySQL `NETWORK_ELEMENT.PARENT_NE_ID_FK`: parent equipment → child (often **router → interface**). \
-				Routers with no parent row in CMDB show an empty parent chain; **children** are **interface** vertices only if those rows exist and `PARENT_NE_ID_FK` points here._
+		if (compactTopologyOutput()) {
+			sb.append("## Network hierarchy\n\n");
+			sb.append("_**PARENT_OF** (parent → child), **CONNECTED_TO** (OSPF interface adjacency), **1-hop neighbor equipment** via interfaces._\n\n");
+		}
+		else {
+			sb.append("## Network topology (inventory)\n\n");
+			sb.append("""
+					_**PARENT_OF** — MySQL `NETWORK_ELEMENT.PARENT_NE_ID_FK`: parent equipment → child (often **router → interface**). \
+					Routers with no parent row in CMDB show an empty parent chain; **children** are **interface** vertices only if those rows exist and `PARENT_NE_ID_FK` points here._
 
-				_**CONNECTED_TO** — from **`OSPF_LINK`**: edges are created between **interface** `NE_NAME`s, not between routers. \
-				**Direct** neighbors below are only non-empty if this vertex is an interface. \
-				**Adjacent equipment (via OSPF)** walks: this NE → child interfaces → `CONNECTED_TO` → peer interface → parent equipment._
+					_**CONNECTED_TO** — from **`OSPF_LINK`**: edges are created between **interface** `NE_NAME`s, not between routers. \
+					**Direct** neighbors below are only non-empty if this vertex is an interface. \
+					Under each **interface** child of a router, an indented line lists **OSPF `CONNECTED_TO` peers** (other interface `nodeId`s). \
+					**Adjacent equipment (via OSPF)** walks: this NE → child interfaces → `CONNECTED_TO` → peer interface → parent equipment._
 
-				""");
+					_When **PARENT_OF** is missing in Janus but interface vertices still use names `{equipment}_{interface…}`, the report can list children via **`nodeId` prefix** (`nova.topology.prefix-fallback-for-interface-vertices`) so links and OSPF neighbors still appear._
+
+					""");
+		}
 		sb.append("**NEs listed:** ").append(distinct.size()).append("\n\n---\n\n");
-		for (String id : distinct) {
+		int total = distinct.size();
+		long invT0 = System.currentTimeMillis();
+		for (int i = 0; i < total; i++) {
+			String id = distinct.get(i);
+			if (i == 0 || (i + 1) % 25 == 0 || i + 1 == total) {
+				log.info("[JanusGraph] Inventory topology report progress: {}/{} (elapsedMs={})",
+						i + 1, total, System.currentTimeMillis() - invT0);
+			}
 			appendInventoryNodeSection(sb, id, maxCh, maxNbr);
 		}
-		sb.append("""
-				
-				_Check **MySQL**: `NETWORK_ELEMENT` should include **INTERFACE** children with `PARENT_NE_ID_FK` set; `OSPF_LINK` should reference interface NE ids. \
-				Run **JanusGraph inventory sync** with `janusgraph.inventory-sync.load-ospf-links=true`. Use `force=true` or `drop-graph-before-sync=true` if the graph was loaded before edges were fixed._
-				""");
+		if (!compactTopologyOutput()) {
+			appendConnectivityAmongNodesMarkdown(sb, distinct);
+			sb.append("""
+					
+					_Check **MySQL**: `NETWORK_ELEMENT` should include **INTERFACE** children with `PARENT_NE_ID_FK` set; `OSPF_LINK` should reference interface NE ids. \
+					Run **JanusGraph inventory sync** with `janusgraph.inventory-sync.load-ospf-links=true`. Use `force=true` or `drop-graph-before-sync=true` if the graph was loaded before edges were fixed._
+					""");
+		}
 		return sb.toString();
 	}
 
+	/**
+	 * JSON subgraph for alarming NEs: expands distinct {@code nodeId}s from alarms with
+	 * {@code PARENT_OF} ancestors/descendants, child interfaces, and OSPF peers (via {@code CONNECTED_TO}),
+	 * then emits vertices and incident edges (endpoints may extend beyond {@code vertices}). Vertex map keys are inventory {@code nodeId} strings
+	 * ({@code NE_NAME}). {@code CONNECTED_TO} edges use {@code relation: "OSPF"} (loaded from
+	 * {@code OSPF_LINK}). Optional {@code popName} / {@code geographyL2Name} appear when stored on vertices.
+	 */
+	public String formatAlarmTopologySubgraphJson(List<String> seedNodeIds, int maxChildrenPerNode,
+			int maxNeighborsPerNode) {
+		ensureJanusGraphHealth();
+		Map<String, Object> shell = new LinkedHashMap<>();
+		shell.put("vertices", Map.of());
+		shell.put("edges", List.of());
+		if (!janusGraphHealthy) {
+			shell.put("note", "JanusGraph unavailable.");
+			String out = writeJsonSafe(shell);
+			log.info("[JanusGraph→LLM] Alarm subgraph JSON (unhealthy) chars={} body={}", out.length(), out);
+			return out;
+		}
+		if (seedNodeIds == null || seedNodeIds.isEmpty()) {
+			shell.put("note", "No seed node IDs.");
+			String out = writeJsonSafe(shell);
+			log.info("[JanusGraph→LLM] Alarm subgraph JSON (no seeds) chars={} body={}", out.length(), out);
+			return out;
+		}
+		long invCap = capInventoryReportNodes();
+		var seedStream = seedNodeIds.stream()
+				.filter(Objects::nonNull)
+				.map(String::trim)
+				.filter(s -> !s.isEmpty())
+				.distinct();
+		List<String> seeds = (invCap >= Integer.MAX_VALUE - 1)
+				? seedStream.toList()
+				: seedStream.limit(invCap).toList();
+		int maxNbr = resolveInventoryFanoutCap(maxNeighborsPerNode, softCapNeighborsWhenUnlimited);
+		int maxCh = resolveInventoryFanoutCap(maxChildrenPerNode, softCapChildrenWhenUnlimited);
+		try {
+			LinkedHashSet<String> subgraph = expandAlarmSubgraphVertices(seeds, maxCh, maxNbr);
+			subgraph = closeSubgraphUnderIncidentEdges(subgraph);
+			if (subgraph.isEmpty()) {
+				shell.put("note", "No JanusGraph vertices for alarm seeds.");
+				String out = writeJsonSafe(shell);
+				log.info("[JanusGraph→LLM] Alarm subgraph JSON (empty subgraph) chars={} body={}", out.length(), out);
+				return out;
+			}
+			List<String> idList = new ArrayList<>(subgraph);
+			Map<String, Map<String, Object>> verticesJson = fetchVerticesForJsonBatch(idList);
+			List<Map<String, Object>> edgesJson = fetchIncidentEdgesJson(idList, true);
+			var root = new LinkedHashMap<String, Object>();
+			root.put("vertices", verticesJson);
+			root.put("edges", edgesJson);
+			root.put("hierarchyHumanReadable", buildHierarchyHumanReadable(edgesJson));
+			root.put("vertexKey", "nodeId");
+			root.put("seedNodeIds", seeds);
+			String json = writeJsonSafe(root);
+			log.info("[JanusGraph→LLM] Alarm subgraph JSON — subgraphNodeCount={}, vertexProps={}, edgeCount={}, "
+							+ "jsonChars={}, seedCount={}",
+					subgraph.size(), verticesJson.size(), edgesJson.size(), json.length(), seeds.size());
+			if (!json.isEmpty()) {
+				if (log.isDebugEnabled()) {
+					log.debug("[JanusGraph→LLM] Alarm subgraph JSON (full body):\n{}", json);
+				}
+				else if (json.length() <= 8_000) {
+					log.info("[JanusGraph→LLM] Alarm subgraph JSON (full body):\n{}", json);
+				}
+				else {
+					log.info("[JanusGraph→LLM] Alarm subgraph JSON (omitted at INFO; {} chars). Preview:\n{}…",
+							json.length(), json.substring(0, Math.min(3_500, json.length())));
+				}
+			}
+			return json;
+		}
+		catch (Exception e) {
+			log.warn("[JanusGraph] Alarm topology JSON failed: {}", e.getMessage());
+			shell.put("error", e.getMessage());
+			String out = writeJsonSafe(shell);
+			log.info("[JanusGraph→LLM] Alarm subgraph JSON (error) chars={} body={}", out.length(), out);
+			return out;
+		}
+	}
+
+	private String writeJsonSafe(Object o) {
+		try {
+			return objectMapper.writeValueAsString(o);
+		}
+		catch (JsonProcessingException e) {
+			return "{\"vertices\":{},\"edges\":[],\"error\":\"json serialization failed\"}";
+		}
+	}
+
+	private LinkedHashSet<String> expandAlarmSubgraphVertices(List<String> seeds, int maxChildrenScan,
+			int maxOspfNeighborsPerNode) {
+		if (seeds.size() >= ALARM_EXPAND_GREMLIN_CHUNK) {
+			log.info("[JanusGraph] Large alarm seed set ({}); using chunked Gremlin expansion", seeds.size());
+			return expandAlarmSubgraphVerticesChunked(seeds, maxChildrenScan, maxOspfNeighborsPerNode);
+		}
+		int vCap = capJsonSubgraphVertices();
+		int dCap = capJsonDescendantsPerSeed();
+		LinkedHashSet<String> acc = new LinkedHashSet<>();
+		for (String seed : seeds) {
+			if (acc.size() >= vCap) {
+				break;
+			}
+			if (!vertexExistsByNodeId(seed)) {
+				continue;
+			}
+			addToSubgraph(acc, seed);
+			try {
+				g.V().has("nodeId", seed).repeat(__.in("PARENT_OF")).emit().values("nodeId")
+						.forEachRemaining(id -> addToSubgraph(acc, Objects.toString(id, "")));
+			}
+			catch (Exception e) {
+				log.debug("[JanusGraph] ancestor expand for {}: {}", seed, e.getMessage());
+			}
+			if (acc.size() >= vCap) {
+				break;
+			}
+			try {
+				var desc = g.V().has("nodeId", seed).repeat(__.out("PARENT_OF")).emit().values("nodeId");
+				if (dCap < Integer.MAX_VALUE / 4) {
+					desc = desc.limit((long) dCap);
+				}
+				desc.forEachRemaining(id -> addToSubgraph(acc, Objects.toString(id, "")));
+			}
+			catch (Exception e) {
+				log.debug("[JanusGraph] descendant expand for {}: {}", seed, e.getMessage());
+			}
+			if (prefixFallbackForInterfaceVertices && countOutParentOfEdges(seed) == 0) {
+				addInterfaceVerticesByEquipmentPrefixIntoSubgraph(acc, seed,
+						effectivePrefixFallbackLimit(maxChildrenScan), vCap);
+			}
+		}
+		List<String> snapshot = new ArrayList<>(acc);
+		for (String n : snapshot) {
+			if (acc.size() >= vCap) {
+				break;
+			}
+			try {
+				optionalLongLimit(g.V().has("nodeId", n).out("PARENT_OF").values("nodeId"), maxChildrenScan)
+						.forEachRemaining(id -> addToSubgraph(acc, Objects.toString(id, "")));
+			}
+			catch (Exception ignored) {
+			}
+		}
+		snapshot = new ArrayList<>(acc);
+		expandOspfAdjacencyForSnapshot(acc, snapshot, seeds, maxOspfNeighborsPerNode, vCap);
+		return acc;
+	}
+
+	private LinkedHashSet<String> expandAlarmSubgraphVerticesChunked(List<String> seeds, int maxChildrenScan,
+			int maxOspfNeighborsPerNode) {
+		int vCap = capJsonSubgraphVertices();
+		int dCap = capJsonDescendantsPerSeed();
+		LinkedHashSet<String> acc = new LinkedHashSet<>();
+		for (int i = 0; i < seeds.size() && acc.size() < vCap; i += ALARM_EXPAND_GREMLIN_CHUNK) {
+			List<String> part = seeds.subList(i, Math.min(i + ALARM_EXPAND_GREMLIN_CHUNK, seeds.size()));
+			try {
+				g.V().has("nodeId", P.within(part)).values("nodeId")
+						.forEachRemaining(id -> addToSubgraph(acc, Objects.toString(id, "")));
+			}
+			catch (Exception e) {
+				log.debug("[JanusGraph] chunked seed presence: {}", e.getMessage());
+			}
+			if (acc.size() >= vCap) {
+				break;
+			}
+			try {
+				var anc = g.V().has("nodeId", P.within(part)).repeat(__.in("PARENT_OF")).emit().values("nodeId");
+				anc.forEachRemaining(id -> addToSubgraph(acc, Objects.toString(id, "")));
+			}
+			catch (Exception e) {
+				log.debug("[JanusGraph] chunked ancestor expand: {}", e.getMessage());
+			}
+			if (acc.size() >= vCap) {
+				break;
+			}
+			try {
+				var desc = g.V().has("nodeId", P.within(part)).repeat(__.out("PARENT_OF")).emit().values("nodeId");
+				if (dCap < Integer.MAX_VALUE / 4) {
+					desc = desc.limit((long) dCap * part.size());
+				}
+				desc.forEachRemaining(id -> addToSubgraph(acc, Objects.toString(id, "")));
+			}
+			catch (Exception e) {
+				log.debug("[JanusGraph] chunked descendant expand: {}", e.getMessage());
+			}
+		}
+		if (prefixFallbackForInterfaceVertices) {
+			int lim = effectivePrefixFallbackLimit(maxChildrenScan);
+			for (String seed : seeds) {
+				if (acc.size() >= vCap) {
+					break;
+				}
+				if (!vertexExistsByNodeId(seed)) {
+					continue;
+				}
+				if (countOutParentOfEdges(seed) > 0) {
+					continue;
+				}
+				addInterfaceVerticesByEquipmentPrefixIntoSubgraph(acc, seed, lim, vCap);
+			}
+		}
+		List<String> snapshot = new ArrayList<>(acc);
+		for (int i = 0; i < snapshot.size() && acc.size() < vCap; i += ALARM_EXPAND_GREMLIN_CHUNK) {
+			List<String> part = snapshot.subList(i, Math.min(i + ALARM_EXPAND_GREMLIN_CHUNK, snapshot.size()));
+			try {
+				var childTrav = g.V().has("nodeId", P.within(part)).out("PARENT_OF").values("nodeId").dedup();
+				if (maxChildrenScan > 0 && maxChildrenScan < Integer.MAX_VALUE / 8) {
+					childTrav = childTrav.limit((long) part.size() * (long) maxChildrenScan);
+				}
+				childTrav.forEachRemaining(id -> addToSubgraph(acc, Objects.toString(id, "")));
+			}
+			catch (Exception ex) {
+				log.debug("[JanusGraph] chunked child expand: {}", ex.getMessage());
+			}
+		}
+		snapshot = new ArrayList<>(acc);
+		expandOspfAdjacencyForSnapshot(acc, snapshot, seeds, maxOspfNeighborsPerNode, vCap);
+		return acc;
+	}
+
+	private void expandOspfAdjacencyForSnapshot(LinkedHashSet<String> acc, List<String> snapshot, List<String> originalSeeds,
+			int maxOspfNeighborsPerNode, int vCap) {
+		if (snapshot.size() > MAX_VERTICES_FOR_OSPF_EXPANSION) {
+			log.info("[JanusGraph] Skipping wide OSPF adjacency expansion (vertices={}; cap={})",
+					snapshot.size(), MAX_VERTICES_FOR_OSPF_EXPANSION);
+			return;
+		}
+		Set<String> seedSet = new HashSet<>(originalSeeds);
+		// When >400 we used to only walk original seeds (routers), but OSPF lives on interface vertices — walk all
+		// vertices until the snapshot is very large so prefix-discovered interfaces still pull peer equipment.
+		boolean onlySeeds = snapshot.size() > 2500;
+		for (String n : snapshot) {
+			if (acc.size() >= vCap) {
+				break;
+			}
+			if (onlySeeds && !seedSet.contains(n)) {
+				continue;
+			}
+			for (Map<String, Object> row : adjacentEquipmentViaOspfInterfaces(n, maxOspfNeighborsPerNode)) {
+				if (acc.size() >= vCap) {
+					break;
+				}
+				Object oid = row.get("nodeId");
+				if (oid != null) {
+					addToSubgraph(acc, oid.toString());
+				}
+			}
+		}
+	}
+
+	private void addToSubgraph(LinkedHashSet<String> acc, String nodeId) {
+		if (nodeId == null || nodeId.isBlank()) {
+			return;
+		}
+		int vCap = capJsonSubgraphVertices();
+		if (acc.size() >= vCap) {
+			return;
+		}
+		acc.add(nodeId.trim());
+	}
+
+	private Map<String, Map<String, Object>> fetchVerticesForJsonBatch(List<String> idList) {
+		Map<String, Map<String, Object>> out = new LinkedHashMap<>();
+		if (idList.isEmpty()) {
+			return out;
+		}
+		try {
+			List<Map<String, Object>> rows = withJsonVertexProjection(g.V().has("nodeId", P.within(idList))).toList();
+			for (Map<String, Object> m : rows) {
+				String nid = str(m, "nodeId");
+				if (nid.isBlank()) {
+					continue;
+				}
+				Map<String, Object> body = new LinkedHashMap<>();
+				body.put("relation", "VERTEX");
+				if (compactTopologyOutput()) {
+					body.put("neType", str(m, "neType", ""));
+					out.put(nid, body);
+					continue;
+				}
+				body.put("neName", str(m, "name", nid));
+				body.put("neType", str(m, "neType", ""));
+				body.put("vendor", str(m, "vendor", ""));
+				String pop = str(m, "popName", "");
+				if (pop.isBlank() || "UNKNOWN".equalsIgnoreCase(pop)) {
+					pop = "";
+				}
+				body.put("popName", pop);
+				String geo = str(m, "geographyL2Name", "");
+				if (geo.isBlank() || "UNKNOWN".equalsIgnoreCase(geo)) {
+					geo = str(m, "domain", "");
+				}
+				if ("UNKNOWN".equalsIgnoreCase(geo)) {
+					geo = "";
+				}
+				body.put("geographyL2Name", geo);
+				body.put("technology", str(m, "technology", ""));
+				body.put("ipv4", str(m, "ipv4", ""));
+				out.put(nid, body);
+			}
+		}
+		catch (Exception e) {
+			log.warn("[JanusGraph] Batch vertex projection for JSON failed: {}", e.getMessage());
+		}
+		return out;
+	}
+
+	/**
+	 * All {@code PARENT_OF} / {@code CONNECTED_TO} edges that touch any vertex in {@code idList}.
+	 * The other endpoint may be absent from {@code vertices} in the JSON — that is intentional so router-only
+	 * subgraphs still show links to interfaces and OSPF peers.
+	 *
+	 * @param logDisconnectedSubgraphDiagnostics when {@code true}, emit WARN when the subgraph has no real edges
+	 *        (inference / empty-graph hints). Inventory markdown calls this with {@code false} so JSON formatting
+	 *        does not duplicate the same warning.
+	 */
+	private List<Map<String, Object>> fetchIncidentEdgesJson(List<String> idList, boolean logDisconnectedSubgraphDiagnostics) {
+		if (idList.isEmpty()) {
+			return List.of();
+		}
+		List<Map<String, Object>> edges = new ArrayList<>();
+		Set<String> dedupe = new HashSet<>();
+		long[] edgeId = { 1L };
+		try {
+			List<Map<String, Object>> parentOut = g.V().has("nodeId", P.within(idList))
+					.outE("PARENT_OF")
+					.project("from", "to")
+					.by(__.outV().values("nodeId"))
+					.by(__.inV().values("nodeId"))
+					.toList();
+			List<Map<String, Object>> parentIn = g.V().has("nodeId", P.within(idList))
+					.inE("PARENT_OF")
+					.project("from", "to")
+					.by(__.outV().values("nodeId"))
+					.by(__.inV().values("nodeId"))
+					.toList();
+			for (Map<String, Object> row : parentOut) {
+				addJsonEdge(edges, dedupe, edgeId, row, "PARENT_OF", null);
+			}
+			for (Map<String, Object> row : parentIn) {
+				addJsonEdge(edges, dedupe, edgeId, row, "PARENT_OF", null);
+			}
+		}
+		catch (Exception e) {
+			log.warn("[JanusGraph] PARENT_OF edge query failed for subgraph (vertices={}): {}", idList.size(), e.toString());
+		}
+		try {
+			List<Map<String, Object>> linkEdges = g.V().has("nodeId", P.within(idList))
+					.bothE("CONNECTED_TO")
+					.dedup()
+					.project("from", "to")
+					.by(__.outV().values("nodeId"))
+					.by(__.inV().values("nodeId"))
+					.toList();
+			for (Map<String, Object> row : linkEdges) {
+				addJsonEdge(edges, dedupe, edgeId, row, "CONNECTED_TO", "OSPF");
+			}
+		}
+		catch (Exception e) {
+			log.warn("[JanusGraph] CONNECTED_TO edge query failed for subgraph (vertices={}): {}", idList.size(), e.toString());
+		}
+		if (edges.isEmpty() && idList.size() > 1) {
+			int inferred = appendInferredParentOfFromCompositeNodeIds(idList, edges, dedupe, edgeId);
+			if (logDisconnectedSubgraphDiagnostics) {
+				if (inferred > 0) {
+					log.warn("[JanusGraph] Graph had no incident PARENT_OF/CONNECTED_TO for this subgraph — added {} "
+							+ "synthetic **PARENT_OF** edges from composite `nodeId` prefixes (e.g. `Router_if_123` → `Router`). "
+							+ "For authoritative links, fix Janus sync / MySQL `PARENT_NE_ID_FK` and `OSPF_LINK`, then reload the graph.",
+							inferred);
+				}
+				else {
+					log.warn("[JanusGraph] Subgraph has {} vertices but **zero** PARENT_OF/CONNECTED_TO edges in JanusGraph and "
+							+ "no inferable composite parent prefixes — topology is disconnected in the graph.",
+							idList.size());
+				}
+			}
+			else if (log.isDebugEnabled()) {
+				log.debug("[JanusGraph] Subgraph edge diagnostics suppressed for this call (inferred={}, vertices={})",
+						inferred, idList.size());
+			}
+		}
+		return edges;
+	}
+
+	/**
+	 * When inventory uses composite {@code NE_NAME} / {@code nodeId} like {@code PE-Router_ge-0/0/0_510} but JanusGraph
+	 * has no {@code PARENT_OF} edge, infer parent as the longest other {@code nodeId} in the set such that
+	 * {@code child.startsWith(parent + "_")}.
+	 */
+	private static int appendInferredParentOfFromCompositeNodeIds(List<String> idList, List<Map<String, Object>> edges,
+			Set<String> dedupe, long[] edgeId) {
+		int added = 0;
+		for (String v : idList) {
+			if (v == null || v.isBlank()) {
+				continue;
+			}
+			String bestParent = null;
+			int bestLen = -1;
+			for (String p : idList) {
+				if (p == null || p.isBlank() || p.equals(v)) {
+					continue;
+				}
+				if (v.length() > p.length() + 1 && v.startsWith(p + "_") && p.length() > bestLen) {
+					bestParent = p;
+					bestLen = p.length();
+				}
+			}
+			if (bestParent == null) {
+				continue;
+			}
+			String key = "PARENT_OF|" + bestParent + "|" + v;
+			if (!dedupe.add(key)) {
+				continue;
+			}
+			Map<String, Object> e = new LinkedHashMap<>();
+			e.put("id", edgeId[0]++);
+			e.put("from", bestParent);
+			e.put("to", v);
+			e.put("label", "PARENT_OF");
+			e.put("relation", null);
+			e.put("inferredFromNeName", Boolean.TRUE);
+			e.put("properties", Map.of());
+			edges.add(e);
+			added++;
+		}
+		return added;
+	}
+
+	private static void addJsonEdge(List<Map<String, Object>> edges, Set<String> dedupe, long[] edgeId,
+			Map<String, Object> row, String label, String relation) {
+		String from = Objects.toString(row.get("from"), "");
+		String to = Objects.toString(row.get("to"), "");
+		String key = label + "|" + from + "|" + to;
+		if (from.isBlank() || to.isBlank() || !dedupe.add(key)) {
+			return;
+		}
+		Map<String, Object> e = new LinkedHashMap<>();
+		e.put("id", edgeId[0]++);
+		e.put("from", from);
+		e.put("to", to);
+		e.put("label", label);
+		e.put("relation", relation);
+		e.put("properties", Map.of());
+		edges.add(e);
+	}
+
+	/**
+	 * Hierarchy-only block: {@code nodeId}, parent chain, child interface {@code nodeId}s,
+	 * 1-hop peer interfaces ({@code CONNECTED_TO}), 1-hop neighbor equipment (OSPF walk). No vendor/domain/IPv4 prose.
+	 */
+	private void appendInventoryNodeSectionCompact(StringBuilder sb, String nodeId, int maxCh, int maxNbr) {
+		sb.append("### `").append(nodeId).append("`\n\n");
+		try {
+			if (!vertexExistsByNodeId(nodeId)) {
+				sb.append("- **NE:** not in graph\n\n");
+				return;
+			}
+			Map<String, Object> self = withPlainTopologyProjection(g.V().has("nodeId", nodeId)).next();
+			sb.append("- **NE:** `").append(nodeId).append("`");
+			String neTypeLine = str(self, "neType", "");
+			if (!neTypeLine.isBlank()) {
+				sb.append(" · ").append(neTypeLine);
+			}
+			sb.append("\n");
+
+			List<String> parentsUp = new ArrayList<>();
+			String cursor = nodeId;
+			for (int d = 0; d < 64; d++) {
+				Optional<Object> parentOpt = g.V().has("nodeId", cursor).in("PARENT_OF").values("nodeId").tryNext();
+				if (parentOpt.isEmpty()) {
+					break;
+				}
+				String p = parentOpt.get().toString();
+				parentsUp.add(p);
+				cursor = p;
+			}
+			Collections.reverse(parentsUp);
+			if (parentsUp.isEmpty()) {
+				sb.append("- **Hierarchy ↑:** _(none — root or missing PARENT_OF)_\n");
+			}
+			else {
+				sb.append("- **Hierarchy ↑:** ");
+				sb.append(parentsUp.stream().map(x -> "`" + x + "`").collect(Collectors.joining(" → ")));
+				sb.append(" → `").append(nodeId).append("`\n");
+			}
+
+			String neTypeSelf = str(self, "neType", "").toUpperCase(Locale.ROOT);
+			boolean equipmentLike = neTypeSelf.contains("ROUTER") || neTypeSelf.contains("SWITCH");
+
+			List<Map<String, Object>> children = withPlainTopologyProjection(
+					optionalLongLimit(g.V().has("nodeId", nodeId).out("PARENT_OF"), maxCh))
+					.toList();
+			boolean listedViaNodeIdPrefix = false;
+			if (children.isEmpty() && equipmentLike && prefixFallbackForInterfaceVertices) {
+				int prefixLim = maxCh > 0 && maxCh < Integer.MAX_VALUE / 8 ? maxCh : effectivePrefixFallbackLimit(maxCh);
+				List<String> ifaceIds = listInterfaceNodeIdsByEquipmentPrefix(nodeId, prefixLim);
+				if (!ifaceIds.isEmpty()) {
+					listedViaNodeIdPrefix = true;
+					children = withPlainTopologyProjection(g.V().has("nodeId", P.within(ifaceIds))).toList();
+				}
+			}
+
+			sb.append("- **Interfaces** (").append(children.size());
+			if (listedViaNodeIdPrefix) {
+				sb.append(" · via `nodeId` prefix");
+			}
+			sb.append("):\n");
+			if (children.isEmpty()) {
+				sb.append("  - _(none)_\n");
+			}
+			else {
+				for (Map<String, Object> c : children) {
+					sb.append("  - `").append(str(c, "nodeId")).append("`\n");
+				}
+			}
+
+			List<Map<String, Object>> peersDirect = withPlainTopologyProjection(
+					optionalLongLimit(g.V().has("nodeId", nodeId).both("CONNECTED_TO").dedup(), maxNbr))
+					.toList();
+			LinkedHashSet<String> peerIfaceIds = new LinkedHashSet<>();
+			for (Map<String, Object> row : peersDirect) {
+				String nid = str(row, "nodeId");
+				if (!nodeId.equals(nid)) {
+					peerIfaceIds.add(nid);
+				}
+			}
+			sb.append("- **Peer interfaces (CONNECTED_TO, 1-hop):** ");
+			if (peerIfaceIds.isEmpty()) {
+				sb.append("_(none)_\n");
+			}
+			else {
+				sb.append(peerIfaceIds.stream().map(x -> "`" + x + "`").collect(Collectors.joining(", ")));
+				sb.append("\n");
+			}
+
+			List<Map<String, Object>> nbrsViaOspf = adjacentEquipmentViaOspfInterfaces(nodeId, maxNbr);
+			if (nbrsViaOspf.isEmpty() && equipmentLike && !children.isEmpty()) {
+				nbrsViaOspf = adjacentEquipmentAggregatedFromInterfaceChildren(nodeId, children, maxNbr,
+						inventoryMaxInterfacesForNeighborWalk);
+			}
+			sb.append("- **Neighbor equipment (1-hop via OSPF):** ");
+			if (nbrsViaOspf.isEmpty()) {
+				sb.append("_(none)_\n");
+			}
+			else {
+				LinkedHashSet<String> eqIds = new LinkedHashSet<>();
+				for (Map<String, Object> n : nbrsViaOspf) {
+					String eid = str(n, "nodeId");
+					if (!eid.isBlank()) {
+						eqIds.add(eid);
+					}
+				}
+				sb.append(eqIds.stream().map(x -> "`" + x + "`").collect(Collectors.joining(", ")));
+				sb.append("\n");
+			}
+			sb.append("\n");
+		}
+		catch (Exception e) {
+			log.warn("[JanusGraph] Failed building compact inventory section for nodeId={}", nodeId, e);
+			sb.append("- **Error:** ").append(e.getMessage()).append("\n\n");
+		}
+	}
+
 	private void appendInventoryNodeSection(StringBuilder sb, String nodeId, int maxCh, int maxNbr) {
+		if (compactTopologyOutput()) {
+			appendInventoryNodeSectionCompact(sb, nodeId, maxCh, maxNbr);
+			return;
+		}
 		sb.append("### `").append(nodeId).append("`\n\n");
 		try {
 			if (!vertexExistsByNodeId(nodeId)) {
@@ -870,26 +1825,71 @@ public class GraphTopologyService {
 				sb.append(" → `").append(nodeId).append("`\n");
 			}
 
+			String neTypeSelf = str(self, "neType", "").toUpperCase(Locale.ROOT);
+			boolean equipmentLike = neTypeSelf.contains("ROUTER") || neTypeSelf.contains("SWITCH");
+
 			List<Map<String, Object>> children = withPlainTopologyProjection(
-					g.V().has("nodeId", nodeId).out("PARENT_OF").limit(maxCh))
+					optionalLongLimit(g.V().has("nodeId", nodeId).out("PARENT_OF"), maxCh))
 					.toList();
-			long childTotal = g.V().has("nodeId", nodeId).out("PARENT_OF").count().tryNext().orElse(0L);
-			sb.append("- **Children (out PARENT_OF), showing ").append(children.size());
-			if (childTotal > children.size()) {
+			long childTotal = children.size();
+			if (maxCh < Integer.MAX_VALUE / 8 && !children.isEmpty() && children.size() >= maxCh) {
+				try {
+					childTotal = g.V().has("nodeId", nodeId).out("PARENT_OF").count().tryNext()
+							.orElse((long) children.size());
+				}
+				catch (Exception e) {
+					log.debug("[JanusGraph] child count for {}: {}", nodeId, e.getMessage());
+					childTotal = children.size();
+				}
+			}
+			boolean listedViaNodeIdPrefix = false;
+			int prefixLim = 0;
+			if (children.isEmpty() && equipmentLike && prefixFallbackForInterfaceVertices) {
+				prefixLim = maxCh > 0 && maxCh < Integer.MAX_VALUE / 8 ? maxCh : effectivePrefixFallbackLimit(maxCh);
+				List<String> ifaceIds = listInterfaceNodeIdsByEquipmentPrefix(nodeId, prefixLim);
+				if (!ifaceIds.isEmpty()) {
+					listedViaNodeIdPrefix = true;
+					childTotal = ifaceIds.size();
+					children = withPlainTopologyProjection(g.V().has("nodeId", P.within(ifaceIds))).toList();
+				}
+			}
+
+			sb.append("- **").append(equipmentLike ? "Interfaces / children" : "Children");
+			sb.append("** (").append(listedViaNodeIdPrefix
+					? "`nodeId` prefix `" + nodeId + "_*` (no **PARENT_OF** from this NE in graph — fix sync for authoritative hierarchy)"
+					: "`out PARENT_OF`");
+			sb.append("), showing ").append(children.size());
+			if (!listedViaNodeIdPrefix && childTotal > children.size()) {
 				sb.append(" of ").append(childTotal);
+			}
+			else if (listedViaNodeIdPrefix && prefixLim > 0 && childTotal >= prefixLim) {
+				sb.append(" _(prefix cap ").append(prefixLim).append(" — more may exist)_");
 			}
 			sb.append(":**\n");
 			if (children.isEmpty()) {
-				sb.append("  - _(none — no `PARENT_OF` children; for routers, add **INTERFACE** rows in MySQL with `PARENT_NE_ID_FK` → this NE’s id)_\n");
+				sb.append("  - _(none — no `PARENT_OF` children and no `").append(nodeId)
+						.append("_*` interface vertices in Janus; add **INTERFACE** rows + `PARENT_NE_ID_FK` in MySQL, then re-sync)_\n");
 			}
 			else {
+				int ospfLineBudget = inventoryMaxInterfacesForOspfPeerLines <= 0 ? Integer.MAX_VALUE
+						: inventoryMaxInterfacesForOspfPeerLines;
+				int ospfLines = 0;
 				for (Map<String, Object> c : children) {
 					sb.append("  - ").append(summarizeElementMap(c)).append("\n");
+					String childId = str(c, "nodeId");
+					if (ospfLines < ospfLineBudget && !childId.isBlank() && !"UNKNOWN".equalsIgnoreCase(childId)) {
+						appendOspfPeersIndented(sb, childId, maxNbr);
+						ospfLines++;
+					}
+				}
+				if (ospfLineBudget < Integer.MAX_VALUE && children.size() > ospfLineBudget) {
+					sb.append("  - _(OSPF peer lines omitted for remaining interfaces; raise ")
+							.append("`nova.topology.inventory-max-interfaces-for-ospf-peer-lines` or set 0 for all)_\n");
 				}
 			}
 
 			List<Map<String, Object>> nbrsDirect = withPlainTopologyProjection(
-					g.V().has("nodeId", nodeId).both("CONNECTED_TO").dedup().limit(maxNbr))
+					optionalLongLimit(g.V().has("nodeId", nodeId).both("CONNECTED_TO").dedup(), maxNbr))
 					.toList();
 			sb.append("- **Direct CONNECTED_TO** (only if this NE is an **interface**), showing ").append(nbrsDirect.size()).append(":**\n");
 			if (nbrsDirect.isEmpty()) {
@@ -906,9 +1906,13 @@ public class GraphTopologyService {
 			}
 
 			List<Map<String, Object>> nbrsViaOspf = adjacentEquipmentViaOspfInterfaces(nodeId, maxNbr);
+			if (nbrsViaOspf.isEmpty() && equipmentLike && !children.isEmpty()) {
+				nbrsViaOspf = adjacentEquipmentAggregatedFromInterfaceChildren(nodeId, children, maxNbr,
+						inventoryMaxInterfacesForNeighborWalk);
+			}
 			sb.append("- **Adjacent equipment (OSPF via interfaces), showing ").append(nbrsViaOspf.size()).append(":**\n");
 			if (nbrsViaOspf.isEmpty()) {
-				sb.append("  - _(none — need interface children under this NE + `CONNECTED_TO` from sync, or this NE has no OSPF-linked paths)_\n");
+				sb.append("  - _(none — need interface vertices + `CONNECTED_TO` from OSPF sync, or this NE has no OSPF-linked paths)_\n");
 			}
 			else {
 				for (Map<String, Object> n : nbrsViaOspf) {
@@ -920,6 +1924,30 @@ public class GraphTopologyService {
 		catch (Exception e) {
 			log.warn("[JanusGraph] Failed building inventory topology section for nodeId={}", nodeId, e);
 			sb.append("- **Error:** ").append(e.getMessage()).append("\n\n");
+		}
+	}
+
+	/** Under an inventory child (usually an interface), list direct OSPF adjacencies on that vertex. */
+	private void appendOspfPeersIndented(StringBuilder sb, String vertexId, int maxPeers) {
+		try {
+			GraphTraversal<?, ?> trav = optionalLongLimit(
+					g.V().has("nodeId", vertexId).both("CONNECTED_TO").dedup().values("nodeId"), maxPeers);
+			LinkedHashSet<String> peers = new LinkedHashSet<>();
+			trav.forEachRemaining(v -> {
+				String p = Objects.toString(v, "").trim();
+				if (!p.isEmpty() && !vertexId.equals(p)) {
+					peers.add(p);
+				}
+			});
+			if (peers.isEmpty()) {
+				return;
+			}
+			sb.append("    - **OSPF `CONNECTED_TO` peers:** ");
+			sb.append(peers.stream().map(x -> "`" + x + "`").collect(Collectors.joining(", ")));
+			sb.append("\n");
+		}
+		catch (Exception e) {
+			log.debug("[JanusGraph] OSPF peers for vertexId={}: {}", vertexId, e.getMessage());
 		}
 	}
 

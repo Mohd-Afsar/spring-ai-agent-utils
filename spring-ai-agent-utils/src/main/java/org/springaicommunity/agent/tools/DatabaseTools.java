@@ -276,12 +276,14 @@ public class DatabaseTools {
 		IMPORTANT: Only SELECT statements are allowed. Any attempt to run INSERT, UPDATE,
 		DELETE, DROP, CREATE, ALTER, or other write operations will be rejected.
 
-		Results are capped at the configured maxRows limit (default 100). For large results,
-		add a LIMIT clause to your query.
+		Results are capped at the configured maxRows limit unless maxRows is 0 (unlimited).
+		For very large tables you may still add LIMIT in SQL to bound response size.
 
 		Tips for writing good queries:
 		- Use DbListTables to discover table names first
-		- Use DbDescribeTable to learn column names and types before querying
+		- Before the first DbQuery against a table in this turn, call DbDescribeTable on that table
+		  (avoids guessed columns and repeated failed SELECTs)
+		- Use DbSample only after describe if you need example values for filters
 		- Use WHERE, GROUP BY, ORDER BY, and JOIN just like regular SQL
 		- Use LIMIT to control result size
 
@@ -301,7 +303,9 @@ public class DatabaseTools {
 		try (Connection conn = this.dataSource.getConnection()) {
 			conn.setReadOnly(true);
 			try (Statement stmt = conn.createStatement()) {
-				stmt.setMaxRows(this.maxRows);
+				if (this.maxRows > 0) {
+					stmt.setMaxRows(this.maxRows);
+				}
 				stmt.setQueryTimeout(30);
 
 				// Always log the SQL so operators can trace report numbers to their data source.
@@ -322,7 +326,8 @@ public class DatabaseTools {
 		Returns a sample of rows from a table to help you understand its contents.
 		Equivalent to running: SELECT * FROM <tableName> LIMIT <limit>
 
-		Use this after DbDescribeTable to see actual data values before writing precise queries.
+		Use after DbDescribeTable to see actual data values (e.g. status enums) before writing precise queries;
+		do not use DbSample instead of DbDescribeTable for column discovery.
 
 		Parameters:
 		- tableName: name of the table to sample (use DbListTables to find table names)
@@ -337,7 +342,8 @@ public class DatabaseTools {
 			return "Invalid table name: " + tableName;
 		}
 
-		int effectiveLimit = (limit != null && limit > 0) ? Math.min(limit, this.maxRows) : 5;
+		int requested = (limit != null && limit > 0) ? limit : 5;
+		int effectiveLimit = this.maxRows > 0 ? Math.min(requested, this.maxRows) : requested;
 		logger.info("[DbSample] Sampling table: {} limit: {} (effectiveLimit)", sanitized, effectiveLimit);
 		return executeQuery("SELECT * FROM " + sanitized + " LIMIT " + effectiveLimit);
 	}
@@ -377,7 +383,8 @@ public class DatabaseTools {
 			return "Query rejected: " + e.getMessage();
 		}
 
-		int size = (pageSize != null && pageSize > 0) ? Math.min(pageSize, this.maxRows) : 25;
+		int requestedSize = (pageSize != null && pageSize > 0) ? pageSize : 25;
+		int size = this.maxRows > 0 ? Math.min(requestedSize, this.maxRows) : requestedSize;
 		int page = (pageNumber != null && pageNumber >= 0) ? pageNumber : 0;
 		int offset = page * size;
 
@@ -544,9 +551,11 @@ public class DatabaseTools {
 			this.dataSource = dataSource;
 		}
 
-		/** Maximum number of rows returned by DbQuery and DbSample. Default: 100. */
+		/**
+		 * Maximum rows returned by DbQuery / DbSample page caps. Use {@code 0} for no JDBC row limit (unlimited).
+		 */
 		public Builder maxRows(int maxRows) {
-			Assert.isTrue(maxRows > 0, "maxRows must be positive");
+			Assert.isTrue(maxRows >= 0, "maxRows must be non-negative (0 = unlimited)");
 			this.maxRows = maxRows;
 			return this;
 		}

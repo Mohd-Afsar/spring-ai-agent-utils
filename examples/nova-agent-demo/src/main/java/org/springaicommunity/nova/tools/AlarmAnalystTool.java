@@ -21,6 +21,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * Specialist sub-agent for alarm analysis and correlation.
@@ -68,7 +69,12 @@ public class AlarmAnalystTool {
 	 * Cap the number of distinct alarming nodes we send into JanusGraph.
 	 * Too many nodes makes RCA traversals expensive.
 	 */
-	private static final int MAX_ALARM_NODEIDS_FOR_TOPOLOGY = 50;
+	/** Distinct node ids passed into Janus RCA when the tool fetches evidence itself (no prior NetworkTopologyRca). */
+	private static final int MAX_ALARM_NODEIDS_FOR_TOPOLOGY = Integer.MAX_VALUE;
+
+	private static final int LLM_MAX_RETRIES = 3;
+
+	private static final int LLM_MAX_WAIT_SECONDS = 30;
 
 	private AlarmAnalystTool(ChatClient.Builder builder, GraphTopologyService graphTopologyService,
 			NetworkIntelligenceTool networkIntelligenceTool) {
@@ -111,6 +117,8 @@ public class AlarmAnalystTool {
 				### topologyInstanceOrGraphEvidence
 				%s
 
+				Use this evidence for PARENT_OF / adjacency reasoning. The operator report does **not** include this raw dump — explain topology-informed conclusions (shared upstream, peers, isolation) in your structured block and summary.
+
 				### rawAlarmData
 				%s
 
@@ -123,7 +131,7 @@ public class AlarmAnalystTool {
 
 		AgentConsole.toolStarted("AlarmAnalyst");
 		try {
-			String alarmAnalysis = this.chatClient.prompt(prompt).call().content();
+			String alarmAnalysis = callWithRateLimitRetries(() -> this.chatClient.prompt(prompt).call().content());
 
 			// Deterministic enrichment: when JanusGraph is enabled, attach
 			// hierarchy/graph evidence during alarm analysis using the same
@@ -149,14 +157,14 @@ public class AlarmAnalystTool {
 								topologyEvidence,
 								investigationContext,
 								alarmAnalysis);
-						// Log a short sample of what we pass to NetworkIntelligence and what we return.
 						log.info("[AlarmAnalyst] JanusGraph evidence sample: {}",
 								evidenceSample(topologyEvidence, 400));
-						return alarmAnalysis + "\n\n---\n\n" + topologyEvidence + "\n\n---\n\n" + networkIntelligence;
+						// Raw hierarchy evidence is for downstream tools / logs only, not the operator report.
+						return alarmAnalysis + "\n\n---\n\n" + networkIntelligence;
 					}
 
 					log.info("[AlarmAnalyst] JanusGraph evidence sample: {}", evidenceSample(topologyEvidence, 400));
-					return alarmAnalysis + "\n\n---\n\n" + topologyEvidence;
+					return alarmAnalysis;
 				}
 			}
 
@@ -165,6 +173,40 @@ public class AlarmAnalystTool {
 		finally {
 			AgentConsole.toolFinished();
 		}
+	}
+
+	private static String callWithRateLimitRetries(Supplier<String> call) {
+		int waitSec = 2;
+		Exception last = null;
+		for (int attempt = 1; attempt <= LLM_MAX_RETRIES; attempt++) {
+			try {
+				return call.get();
+			}
+			catch (Exception e) {
+				last = e;
+				String msg = e.getMessage() != null ? e.getMessage() : "";
+				boolean rate = msg.contains("429") || msg.contains("rate_limit_exceeded") || msg.contains("Rate limit");
+				boolean cap = msg.contains("503") || msg.contains("over capacity") || msg.contains("TransientAiException");
+				if ((rate || cap) && attempt < LLM_MAX_RETRIES) {
+					int wait = cap ? Math.max(waitSec * 2, 30) : Math.min(waitSec, LLM_MAX_WAIT_SECONDS);
+					log.warn("[AlarmAnalyst] {} — sleeping {}s then retry {}/{}",
+							cap ? "Model over capacity" : "Rate limited", wait, attempt, LLM_MAX_RETRIES);
+					try {
+						Thread.sleep(wait * 1000L);
+					}
+					catch (InterruptedException ie) {
+						Thread.currentThread().interrupt();
+						return "[AlarmAnalyst interrupted during rate-limit backoff]";
+					}
+					waitSec = Math.min(waitSec * 2, LLM_MAX_WAIT_SECONDS);
+				}
+				else {
+					break;
+				}
+			}
+		}
+		String m = last != null && last.getMessage() != null ? last.getMessage() : "unknown error";
+		return "[AlarmAnalyst error after retries: " + m + "]";
 	}
 
 	/**
@@ -195,7 +237,8 @@ public class AlarmAnalystTool {
 		if (nodeIdIdx < 0) nodeIdIdx = findHeaderIndex(headerCells, "node_name");
 		if (nodeIdIdx < 0) {
 			for (int i = 0; i < headerCells.size(); i++) {
-				if (headerCells.get(i).toLowerCase(Locale.ROOT).contains("node")) {
+				String h = headerCells.get(i).toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
+				if (h.contains("nodeid") || h.contains("nodename")) {
 					nodeIdIdx = i;
 					break;
 				}
@@ -222,7 +265,7 @@ public class AlarmAnalystTool {
 		String w = wanted.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
 		for (int i = 0; i < headers.size(); i++) {
 			String h = headers.get(i).toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
-			if (h.equals(w) || h.contains(w)) {
+			if (h.equals(w) || h.endsWith(w) || (w.length() >= 6 && h.startsWith(w))) {
 				return i;
 			}
 		}
