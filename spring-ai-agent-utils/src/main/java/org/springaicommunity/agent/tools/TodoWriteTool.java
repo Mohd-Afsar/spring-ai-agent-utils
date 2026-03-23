@@ -15,7 +15,7 @@
 */
 package org.springaicommunity.agent.tools;
 
-import java.util.List;
+import java.util.Arrays;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -263,11 +263,11 @@ public class TodoWriteTool {
 			throw new IllegalArgumentException("Todos cannot be null");
 		}
 
-		List<Todos.TodoItem> items = todos.todos();
+		Todos.TodoItem[] items = todos.todos();
 
 		// Validate each task first (before counting in_progress tasks)
-		for (int i = 0; i < items.size(); i++) {
-			Todos.TodoItem item = items.get(i);
+		for (int i = 0; i < items.length; i++) {
+			Todos.TodoItem item = items[i];
 
 			if (item == null) {
 				throw new IllegalArgumentException("Task at index " + i + " is null");
@@ -290,7 +290,7 @@ public class TodoWriteTool {
 		}
 
 		// Count in_progress tasks after validating all items
-		long inProgressCount = items.stream().filter(item -> item.status() == Todos.Status.in_progress).count();
+		long inProgressCount = Arrays.stream(items).filter(item -> item.status() == Todos.Status.in_progress).count();
 
 		if (inProgressCount > 1) {
 			throw new IllegalArgumentException("Only ONE task can be in_progress at a time. Found " + inProgressCount
@@ -298,7 +298,7 @@ public class TodoWriteTool {
 		}
 	}
 
-	public record Todos(List<TodoItem> todos) {
+	public record Todos(TodoItem[] todos) {
 		public record TodoItem(String content, Status status, String activeForm) {
 		}
 

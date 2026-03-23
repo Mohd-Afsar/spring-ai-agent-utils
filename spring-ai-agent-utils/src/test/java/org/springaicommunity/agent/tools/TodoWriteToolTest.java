@@ -80,7 +80,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should accept valid todos with one pending task")
 		void shouldAcceptValidTodosWithOnePendingTask() {
-			List<TodoItem> items = List.of(new TodoItem("Fix bug", Status.pending, "Fixing bug"));
+			TodoItem[] items = new TodoItem[]{new TodoItem("Fix bug", Status.pending, "Fixing bug")};
 			Todos todos = new Todos(items);
 
 			String result = TodoWriteToolTest.this.tool.todoWrite(todos);
@@ -92,7 +92,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should accept valid todos with one in_progress task")
 		void shouldAcceptValidTodosWithOneInProgressTask() {
-			List<TodoItem> items = List.of(new TodoItem("Implement feature", Status.in_progress, "Implementing feature"));
+			TodoItem[] items = new TodoItem[]{new TodoItem("Implement feature", Status.in_progress, "Implementing feature")};
 			Todos todos = new Todos(items);
 
 			String result = TodoWriteToolTest.this.tool.todoWrite(todos);
@@ -104,9 +104,9 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should accept valid todos with multiple tasks and one in_progress")
 		void shouldAcceptValidTodosWithMultipleTasksAndOneInProgress() {
-			List<TodoItem> items = List.of(new TodoItem("Task 1", Status.completed, "Completing task 1"),
+			TodoItem[] items = new TodoItem[]{new TodoItem("Task 1", Status.completed, "Completing task 1"),
 					new TodoItem("Task 2", Status.in_progress, "Working on task 2"),
-					new TodoItem("Task 3", Status.pending, "Preparing task 3"));
+					new TodoItem("Task 3", Status.pending, "Preparing task 3")};
 			Todos todos = new Todos(items);
 
 			String result = TodoWriteToolTest.this.tool.todoWrite(todos);
@@ -119,8 +119,8 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should accept valid todos with all completed tasks")
 		void shouldAcceptValidTodosWithAllCompletedTasks() {
-			List<TodoItem> items = List.of(new TodoItem("Task 1", Status.completed, "Completing task 1"),
-					new TodoItem("Task 2", Status.completed, "Completing task 2"));
+			TodoItem[] items = new TodoItem[]{new TodoItem("Task 1", Status.completed, "Completing task 1"),
+					new TodoItem("Task 2", Status.completed, "Completing task 2")};
 			Todos todos = new Todos(items);
 
 			String result = TodoWriteToolTest.this.tool.todoWrite(todos);
@@ -132,7 +132,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should accept empty todo list")
 		void shouldAcceptEmptyTodoList() {
-			Todos todos = new Todos(new ArrayList<>());
+			Todos todos = new Todos(new TodoItem[0]);
 
 			String result = TodoWriteToolTest.this.tool.todoWrite(todos);
 
@@ -149,8 +149,8 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should reject todos with two in_progress tasks")
 		void shouldRejectTodosWithTwoInProgressTasks() {
-			List<TodoItem> items = List.of(new TodoItem("Task 1", Status.in_progress, "Working on task 1"),
-					new TodoItem("Task 2", Status.in_progress, "Working on task 2"));
+			TodoItem[] items = new TodoItem[]{new TodoItem("Task 1", Status.in_progress, "Working on task 1"),
+					new TodoItem("Task 2", Status.in_progress, "Working on task 2")};
 			Todos todos = new Todos(items);
 
 			assertThatThrownBy(() -> TodoWriteToolTest.this.tool.todoWrite(todos))
@@ -162,9 +162,9 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should reject todos with three in_progress tasks")
 		void shouldRejectTodosWithThreeInProgressTasks() {
-			List<TodoItem> items = List.of(new TodoItem("Task 1", Status.in_progress, "Working on task 1"),
+			TodoItem[] items = new TodoItem[]{new TodoItem("Task 1", Status.in_progress, "Working on task 1"),
 					new TodoItem("Task 2", Status.in_progress, "Working on task 2"),
-					new TodoItem("Task 3", Status.in_progress, "Working on task 3"));
+					new TodoItem("Task 3", Status.in_progress, "Working on task 3")};
 			Todos todos = new Todos(items);
 
 			assertThatThrownBy(() -> TodoWriteToolTest.this.tool.todoWrite(todos))
@@ -182,7 +182,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should reject todo with null content")
 		void shouldRejectTodoWithNullContent() {
-			List<TodoItem> items = List.of(new TodoItem(null, Status.pending, "Doing something"));
+			TodoItem[] items = new TodoItem[]{new TodoItem(null, Status.pending, "Doing something")};
 			Todos todos = new Todos(items);
 
 			assertThatThrownBy(() -> TodoWriteToolTest.this.tool.todoWrite(todos))
@@ -193,7 +193,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should reject todo with empty content")
 		void shouldRejectTodoWithEmptyContent() {
-			List<TodoItem> items = List.of(new TodoItem("", Status.pending, "Doing something"));
+			TodoItem[] items = new TodoItem[]{new TodoItem("", Status.pending, "Doing something")};
 			Todos todos = new Todos(items);
 
 			assertThatThrownBy(() -> TodoWriteToolTest.this.tool.todoWrite(todos))
@@ -204,7 +204,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should reject todo with blank content")
 		void shouldRejectTodoWithBlankContent() {
-			List<TodoItem> items = List.of(new TodoItem("   ", Status.pending, "Doing something"));
+			TodoItem[] items = new TodoItem[]{new TodoItem("   ", Status.pending, "Doing something")};
 			Todos todos = new Todos(items);
 
 			assertThatThrownBy(() -> TodoWriteToolTest.this.tool.todoWrite(todos))
@@ -215,8 +215,8 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should reject second todo with blank content")
 		void shouldRejectSecondTodoWithBlankContent() {
-			List<TodoItem> items = List.of(new TodoItem("Valid task", Status.pending, "Doing valid task"),
-					new TodoItem("   ", Status.pending, "Doing something"));
+			TodoItem[] items = new TodoItem[]{new TodoItem("Valid task", Status.pending, "Doing valid task"),
+					new TodoItem("   ", Status.pending, "Doing something")};
 			Todos todos = new Todos(items);
 
 			assertThatThrownBy(() -> TodoWriteToolTest.this.tool.todoWrite(todos))
@@ -234,7 +234,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should reject todo with null activeForm")
 		void shouldRejectTodoWithNullActiveForm() {
-			List<TodoItem> items = List.of(new TodoItem("Fix bug", Status.pending, null));
+			TodoItem[] items = new TodoItem[]{new TodoItem("Fix bug", Status.pending, null)};
 			Todos todos = new Todos(items);
 
 			assertThatThrownBy(() -> TodoWriteToolTest.this.tool.todoWrite(todos))
@@ -245,7 +245,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should reject todo with empty activeForm")
 		void shouldRejectTodoWithEmptyActiveForm() {
-			List<TodoItem> items = List.of(new TodoItem("Fix bug", Status.pending, ""));
+			TodoItem[] items = new TodoItem[]{new TodoItem("Fix bug", Status.pending, "")};
 			Todos todos = new Todos(items);
 
 			assertThatThrownBy(() -> TodoWriteToolTest.this.tool.todoWrite(todos))
@@ -256,7 +256,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should reject todo with blank activeForm")
 		void shouldRejectTodoWithBlankActiveForm() {
-			List<TodoItem> items = List.of(new TodoItem("Fix bug", Status.pending, "   "));
+			TodoItem[] items = new TodoItem[]{new TodoItem("Fix bug", Status.pending, "   ")};
 			Todos todos = new Todos(items);
 
 			assertThatThrownBy(() -> TodoWriteToolTest.this.tool.todoWrite(todos))
@@ -273,7 +273,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should reject todo with null status")
 		void shouldRejectTodoWithNullStatus() {
-			List<TodoItem> items = List.of(new TodoItem("Fix bug", null, "Fixing bug"));
+			TodoItem[] items = new TodoItem[]{new TodoItem("Fix bug", null, "Fixing bug")};
 			Todos todos = new Todos(items);
 
 			assertThatThrownBy(() -> TodoWriteToolTest.this.tool.todoWrite(todos))
@@ -309,9 +309,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Should reject null todo item")
 		void shouldRejectNullTodoItem() {
-			List<TodoItem> items = new ArrayList<>();
-			items.add(null);
-			Todos todos = new Todos(items);
+			Todos todos = new Todos(new TodoItem[]{null});
 
 			assertThatThrownBy(() -> TodoWriteToolTest.this.tool.todoWrite(todos))
 				.isInstanceOf(IllegalArgumentException.class)
@@ -337,7 +335,7 @@ class TodoWriteToolTest {
 		@Test
 		@DisplayName("Todos should be a record with proper fields")
 		void todosShouldBeRecordWithProperFields() {
-			List<TodoItem> items = List.of(new TodoItem("Task 1", Status.pending, "Doing task 1"));
+			TodoItem[] items = new TodoItem[]{new TodoItem("Task 1", Status.pending, "Doing task 1")};
 			Todos todos = new Todos(items);
 
 			assertThat(todos.todos()).isEqualTo(items);
@@ -361,26 +359,26 @@ class TodoWriteToolTest {
 		@DisplayName("Should handle workflow from pending to in_progress to completed")
 		void shouldHandleWorkflowFromPendingToInProgressToCompleted() {
 			// Initial state - all pending
-			List<TodoItem> items1 = List.of(new TodoItem("Task 1", Status.pending, "Doing task 1"),
-					new TodoItem("Task 2", Status.pending, "Doing task 2"));
+			TodoItem[] items1 = new TodoItem[]{new TodoItem("Task 1", Status.pending, "Doing task 1"),
+					new TodoItem("Task 2", Status.pending, "Doing task 2")};
 			Todos todos1 = new Todos(items1);
 			TodoWriteToolTest.this.tool.todoWrite(todos1);
 
 			// Start working on task 1
-			List<TodoItem> items2 = List.of(new TodoItem("Task 1", Status.in_progress, "Doing task 1"),
-					new TodoItem("Task 2", Status.pending, "Doing task 2"));
+			TodoItem[] items2 = new TodoItem[]{new TodoItem("Task 1", Status.in_progress, "Doing task 1"),
+					new TodoItem("Task 2", Status.pending, "Doing task 2")};
 			Todos todos2 = new Todos(items2);
 			TodoWriteToolTest.this.tool.todoWrite(todos2);
 
 			// Complete task 1, start task 2
-			List<TodoItem> items3 = List.of(new TodoItem("Task 1", Status.completed, "Doing task 1"),
-					new TodoItem("Task 2", Status.in_progress, "Doing task 2"));
+			TodoItem[] items3 = new TodoItem[]{new TodoItem("Task 1", Status.completed, "Doing task 1"),
+					new TodoItem("Task 2", Status.in_progress, "Doing task 2")};
 			Todos todos3 = new Todos(items3);
 			TodoWriteToolTest.this.tool.todoWrite(todos3);
 
 			// Complete all tasks
-			List<TodoItem> items4 = List.of(new TodoItem("Task 1", Status.completed, "Doing task 1"),
-					new TodoItem("Task 2", Status.completed, "Doing task 2"));
+			TodoItem[] items4 = new TodoItem[]{new TodoItem("Task 1", Status.completed, "Doing task 1"),
+					new TodoItem("Task 2", Status.completed, "Doing task 2")};
 			Todos todos4 = new Todos(items4);
 			String result = TodoWriteToolTest.this.tool.todoWrite(todos4);
 

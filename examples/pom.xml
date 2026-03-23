@@ -37,6 +37,7 @@
         <module>subagent-demo</module>
         <module>subagent-a2a-demo</module>
         <module>todo-demo</module>
+        <module>nova-agent-demo</module>
     </modules>
 
     <repositories>
