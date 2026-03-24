@@ -2,21 +2,14 @@ package org.springaicommunity.nova;
 
 import java.util.Scanner;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.ArrayList;
-import java.util.LinkedHashSet;
-import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.HashSet;
 import java.util.Locale;
-import java.sql.Connection;
-import java.sql.DatabaseMetaData;
-import java.sql.ResultSet;
-import java.sql.SQLException;
 
 import javax.sql.DataSource;
 
 import java.util.List;
+import java.util.Optional;
 
 import org.springaicommunity.agent.tools.DatabaseTools;
 import org.springaicommunity.nova.graph.GraphTopologyService;
@@ -33,7 +26,6 @@ import org.springframework.ai.chat.client.advisor.ToolCallAdvisor;
 import org.springframework.ai.chat.memory.MessageWindowChatMemory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import java.util.Optional;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -82,8 +74,48 @@ public class NovaApplication {
 	 */
 	private static final int MAX_WAIT_SECONDS = 30;
 	private static final int MAX_ALARM_DATA_CHARS_FOR_LLM = 100000;
-	/** Cap topology markdown inside AlarmAnalyst user message; full topology still appended after analysis. */
-	private static final int MAX_TOPOLOGY_CHARS_INSIDE_ALARM_ANALYST_PROMPT = 14000;
+	private static final String DEFAULT_ALARM_FILTER_SQL = """
+			SELECT
+			    ALARM_EXTERNAL_ID,
+			    ALARM_CODE,
+			    ALARM_NAME,
+			    OPEN_TIME,
+			    CHANGE_TIME,
+			    LAST_PROCESSING_TIME,
+			    FIRST_RECEPTION_TIME,
+			    REPORTING_TIME,
+			    SEVERITY,
+			    ACTUAL_SEVERITY,
+			    ALARM_STATUS,
+			    CLASSIFICATION,
+			    ENTITY_ID,
+			    ENTITY_NAME,
+			    ENTITY_TYPE,
+			    SUBENTITY,
+			    PARENT_ENTITY_ID,
+			    GEOGRAPHY_L1_NAME,
+			    GEOGRAPHY_L2_NAME,
+			    GEOGRAPHY_L3_NAME,
+			    VENDOR,
+			    DOMAIN,
+			    TECHNOLOGY,
+			    PROBABLE_CAUSE,
+			    DESCRIPTION,
+			    EVENT_TYPE,
+			    SERVICE_AFFECTED,
+			    INCIDENT_ID,
+			    CORRELATION_FLAG,
+			    ALARM_GROUP
+			FROM ALARM
+			WHERE ALARM_STATUS IN ('OPEN','REOPEN')
+			  AND SEVERITY IN ('CRITICAL','MAJOR','MINOR')
+			""";
+	private static final String DEFAULT_ALARM_HIERARCHY_SEED_SQL = """
+			SELECT DISTINCT ENTITY_NAME
+			FROM ALARM
+			WHERE ALARM_STATUS IN ('OPEN','REOPEN')
+			  AND SEVERITY IN ('CRITICAL','MAJOR')
+			""";
 
 	public static void main(String[] args) {
 		SpringApplication.run(NovaApplication.class, args);
@@ -109,7 +141,6 @@ public class NovaApplication {
 		System.out.println("pmApiBaseUrl: " + pmApiBaseUrl);
 		System.out.println("dataSource: " + dataSource);
 		System.out.println("analyticsEngine: " + analyticsEngine);
-		System.out.println("graphTopologyService: " + graphTopologyService);
 		System.out.println("--------------------------------\n\n\n");
 
 		// Clone the builder BEFORE adding any NOVA-specific tools/system prompt.
@@ -119,7 +150,6 @@ public class NovaApplication {
 		GraphTopologyService graphServiceOrNull = graphTopologyService.orElse(null);
 		DatabaseTools databaseTools = DatabaseTools.builder(dataSource).maxRows(500).build();
 		AlarmAnalystTool alarmAnalystTool = AlarmAnalystTool.builder(subAgentBuilder.clone())
-				.graphTopologyService(graphServiceOrNull)
 				.build();
 		KPIAnalystTool kpiAnalystTool = KPIAnalystTool.builder(subAgentBuilder.clone()).build();
 		NetworkIntelligenceTool networkIntelligenceTool = NetworkIntelligenceTool.builder(subAgentBuilder.clone()).build();
@@ -130,7 +160,7 @@ public class NovaApplication {
 				.dataSource(dataSource)
 				.build();
 		ReportFormatterTool reportFormatterTool = ReportFormatterTool.builder(subAgentBuilder.clone())
-				.graphTopologyService(graphServiceOrNull)
+				.graphTopologyService(null)
 				.build();
 		NetworkTopologyRcaTool networkTopologyRcaTool = (graphServiceOrNull != null)
 				? NetworkTopologyRcaTool.of(graphServiceOrNull, subAgentBuilder.clone(), novaTopologyMaxAlarmingNodes,
@@ -155,15 +185,7 @@ public class NovaApplication {
 			networkIntelligenceTool,
 			pmDataFetchTool,
 			reportFormatterTool);
-			// Note: ReportFormatterTool also performs optional JanusGraph evidence
-			// enrichment as a fallback when AlarmAnalyst wasn't called.
-			// It requires GraphTopologyService injection.
-
-		// Layer 3: JanusGraph topology RCA — only registered when janusgraph.enabled=true
-		graphTopologyService.ifPresent(service -> {
-			novaBuilder.defaultTools(networkTopologyRcaTool);
-			System.out.println("║  Graph RCA:  NetworkTopologyRca (JanusGraph)         ║");
-		});
+			// JanusGraph integration removed from NOVA runtime flow.
 
 		ChatClient nova = novaBuilder
 
@@ -176,8 +198,7 @@ public class NovaApplication {
 						.build())
 
 				.build();
-			log.info("[NOVA] GraphTopologyService available: {}", graphServiceOrNull != null);
-			log.info("[NOVA] Registered topology tool: {}", graphServiceOrNull != null ? "NetworkTopologyRca" : "none");
+			log.info("[NOVA] JanusGraph integration: disabled");
 
 			System.out.println();
 			System.out.println("╔══════════════════════════════════════════════════════╗");
@@ -197,28 +218,21 @@ public class NovaApplication {
 						System.out.println("NOVA: Shift handed over. Signing off.");
 						System.exit(0);
 					}
-					if (isJanusGraphInventoryRequest(input)) {
-						String response = graphServiceOrNull != null
-								? graphServiceOrNull.inventorySummary()
-								: "JanusGraph is disabled or not configured (graphTopologyService is unavailable).";
+					if (isAlarmAnalysisRequest(input)) {
+						log.info("[NOVA] Running deterministic alarm orchestration for input='{}'", input);
+						String response = runDeterministicAlarmFlow(input, databaseTools, alarmAnalystTool, networkTopologyRcaTool);
 						System.out.println("\nNOVA: " + response);
 						continue;
 					}
-					if (isAlarmAnalysisRequest(input)) {
-						log.info("[NOVA] Running deterministic alarm orchestration for input='{}'", input);
-						String response = runDeterministicAlarmFlow(input, dataSource, databaseTools, alarmAnalystTool, networkTopologyRcaTool);
+					if (isAlarmHierarchyTopologyRequest(input)) {
+						log.info("[NOVA] Running deterministic alarm hierarchy topology flow for input='{}'", input);
+						String response = runDeterministicAlarmHierarchyFlow(input, databaseTools, networkTopologyRcaTool);
 						System.out.println("\nNOVA: " + response);
 						continue;
 					}
 					if (isPmKpiIntent(input)) {
 						log.info("[NOVA][Routing] Running deterministic PM/KPI orchestration for input='{}'", input);
 						String response = runDeterministicPmFlow(input, pmDataFetchTool);
-						System.out.println("\nNOVA: " + response);
-						continue;
-					}
-					if (isTopologyConnectivityIntent(input)) {
-						log.info("[NOVA][Routing] Running deterministic topology-connectivity orchestration for input='{}'", input);
-						String response = runDeterministicConnectivityFlow(input, networkTopologyRcaTool);
 						System.out.println("\nNOVA: " + response);
 						continue;
 					}
@@ -238,11 +252,6 @@ public class NovaApplication {
 	 */
 	private static String callWithRetry(ChatClient nova, String input) throws InterruptedException {
 		int waitSec = 2;
-		boolean topologyIntent = isTopologyConnectivityIntent(input);
-		if (topologyIntent) {
-			log.info("[NOVA][Routing] Topology-connectivity intent detected for input='{}'", input);
-		}
-
 		for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
 			AgentConsole.beginToolTracking();
 			long startMs = System.currentTimeMillis();
@@ -280,26 +289,16 @@ public class NovaApplication {
 				done.set(true);
 				progress.join();
 				List<String> toolsUsed = AgentConsole.endToolTracking();
-				boolean janusGraphUsed = toolsUsed.stream().anyMatch("NetworkTopologyRca"::equals)
-						|| AgentConsole.isJanusGraphEvidenceCalled();
+				boolean janusGraphUsed = AgentConsole.isJanusGraphEvidenceCalled();
 				log.info("[NOVA] Tools used this turn: {} | JanusGraph topology RCA invoked: {}", toolsUsed, janusGraphUsed);
-				if (topologyIntent && !janusGraphUsed) {
-					log.warn("[NOVA][Routing] Topology intent detected but JanusGraph tool not invoked. input='{}' toolsUsed={} -> likely model selected DB-only path or intent ambiguity. Consider explicit wording like 'use JanusGraph topology' to force tool routing.",
-							input, toolsUsed);
-				}
 				return result;
 			}
 			catch (Exception e) {
 				done.set(true);
 				progress.join();
 				List<String> toolsUsed = AgentConsole.endToolTracking();
-				boolean janusGraphUsed = toolsUsed.stream().anyMatch("NetworkTopologyRca"::equals)
-						|| AgentConsole.isJanusGraphEvidenceCalled();
+				boolean janusGraphUsed = AgentConsole.isJanusGraphEvidenceCalled();
 				log.info("[NOVA] Tools used this turn before failure: {} | JanusGraph topology RCA invoked: {}", toolsUsed, janusGraphUsed);
-				if (topologyIntent && !janusGraphUsed) {
-					log.warn("[NOVA][Routing] Topology intent detected before failure, but JanusGraph tool was still not invoked. input='{}' toolsUsed={}",
-							input, toolsUsed);
-				}
 
 				String msg = e.getMessage() != null ? e.getMessage() : "";
 				boolean isRateLimit = msg.contains("429") || msg.contains("rate_limit_exceeded")
@@ -353,131 +352,83 @@ public class NovaApplication {
 				|| lower.contains("rca");
 	}
 
-	private static boolean isJanusGraphInventoryRequest(String input) {
-		if (input == null) return false;
-		String lower = input.toLowerCase();
-		return (lower.contains("janusgraph") || lower.contains("graph"))
-				&& (lower.contains("how many") || lower.contains("count"))
-				&& (lower.contains("node") || lower.contains("interface"));
-	}
-
-	private static boolean isTopologyConnectivityIntent(String input) {
+	private static boolean isAlarmHierarchyTopologyRequest(String input) {
 		if (input == null || input.isBlank()) return false;
 		String lower = input.toLowerCase(Locale.ROOT);
-		boolean hasConnectivityVerb = lower.contains("connected")
-				|| lower.contains("connectivity")
-				|| lower.contains("neighbour")
-				|| lower.contains("neighbor")
-				|| lower.contains("adjacent")
-				|| lower.contains("linked")
-				|| lower.contains("topology");
-		boolean hasEntityHint = lower.contains("node")
-				|| lower.contains("ip")
-				|| lower.matches(".*\\b\\d{1,3}(\\.\\d{1,3}){3}\\b.*");
-		return hasConnectivityVerb && hasEntityHint;
+		boolean asksTopology = lower.contains("hierarchy")
+				|| lower.contains("topology")
+				|| lower.contains("connected");
+		boolean asksLinks = lower.contains("interface")
+				|| lower.contains("interfaces")
+				|| lower.contains("link")
+				|| lower.contains("links");
+		boolean alarmScoped = lower.contains("alarm");
+		return alarmScoped && asksTopology && asksLinks;
 	}
 
 	private static String runDeterministicAlarmFlow(String userInput,
-			DataSource dataSource,
 			DatabaseTools databaseTools,
 			AlarmAnalystTool alarmAnalystTool,
 			NetworkTopologyRcaTool networkTopologyRcaTool) {
 		AgentConsole.beginToolTracking();
 		try {
-			String sql = buildAlarmFetchSql(dataSource);
+			String sql = buildAlarmFetchSql();
 			String rawAlarmData = databaseTools.executeQuery(sql);
-
-			List<String> interfaces = extractDistinctFromMarkdownTable(rawAlarmData,
-					List.of("interface", "ifname", "if_name", "port", "port_name", "source_interface"));
-
 			String scope = "overall active alarms";
 			String investigationContext = scope + " | userRequest='" + userInput + "'";
-			if (!interfaces.isEmpty()) {
-				investigationContext += " | interfaceSample=" + String.join(", ", interfaces.stream().toList());
-			}
-
-			String topologyEvidence;
 			if (networkTopologyRcaTool == null) {
-				topologyEvidence = "_JanusGraph topology RCA is disabled (janusgraph.enabled=false)._";
+				List<String> toolsUsed = AgentConsole.endToolTracking();
+				log.info("[NOVA] Tools used this turn: {} | JanusGraph topology RCA invoked: false", toolsUsed);
+				return "[Mandatory topology step failed: JanusGraph topology service is unavailable.]";
 			}
-			else {
-				// Full alarm markdown → parse topology-related columns → MySQL NE_NAME → JanusGraph structure for LLM RCA
-				topologyEvidence = networkTopologyRcaTool.analyzeTopologyForAlarmMarkdown(rawAlarmData, investigationContext);
-			}
-			// Never log full topology at INFO — it floods the console and duplicates the LLM payload.
-			log.info("[NOVA] Topology evidence built: chars={}", topologyEvidence != null ? topologyEvidence.length() : 0);
-			if (log.isDebugEnabled() && topologyEvidence != null) {
-				int n = Math.min(500, topologyEvidence.length());
-				log.debug("[NOVA] Topology evidence preview (first {} chars): {}", n,
-						topologyEvidence.substring(0, n).replace("\n", "\\n"));
-			}
-
+			String hierarchySeedSql = buildAlarmHierarchySeedSql();
+			String hierarchySeedData = databaseTools.executeQuery(hierarchySeedSql);
+			String topologyEvidence = networkTopologyRcaTool.analyzeTopologyForAlarmMarkdown(hierarchySeedData, investigationContext, false);
 			String alarmDataForLlm = shrinkAlarmDataForLlm(rawAlarmData, MAX_ALARM_DATA_CHARS_FOR_LLM);
-			if (alarmDataForLlm.length() < rawAlarmData.length()) {
+			if (rawAlarmData != null && alarmDataForLlm.length() < rawAlarmData.length()) {
 				log.warn("[NOVA] Truncated alarm data for AlarmAnalyst. originalChars={} sentChars={}",
 						rawAlarmData.length(), alarmDataForLlm.length());
 			}
-			String topologyForAnalystPrompt = topologyEvidence;
-			if (topologyForAnalystPrompt != null && topologyForAnalystPrompt.length() > MAX_TOPOLOGY_CHARS_INSIDE_ALARM_ANALYST_PROMPT) {
-				topologyForAnalystPrompt = topologyForAnalystPrompt.substring(0, MAX_TOPOLOGY_CHARS_INSIDE_ALARM_ANALYST_PROMPT)
-						+ "\n\n[TOPOLOGY_TRUNCATED_FOR_LLM: full copy below under 'Topology Hierarchy Evidence']\n";
-				log.warn("[NOVA] Truncated topology inside AlarmAnalyst prompt. sentChars={} fullChars={}",
-						MAX_TOPOLOGY_CHARS_INSIDE_ALARM_ANALYST_PROMPT, topologyEvidence.length());
-			}
 			String alarmAnalysis = alarmAnalystTool.analyzeAlarms(alarmDataForLlm, investigationContext,
-					topologyForAnalystPrompt != null ? topologyForAnalystPrompt : "");
-			String merged = alarmAnalysis + "\n\n---\n\n### Topology Hierarchy Evidence\n\n" + topologyEvidence;
+					topologyEvidence);
 
 			List<String> toolsUsed = AgentConsole.endToolTracking();
-			boolean janusGraphUsed = toolsUsed.stream().anyMatch("NetworkTopologyRca"::equals)
-					|| AgentConsole.isJanusGraphEvidenceCalled();
+			boolean janusGraphUsed = AgentConsole.isJanusGraphEvidenceCalled();
 			log.info("[NOVA] Tools used this turn: {} | JanusGraph topology RCA invoked: {}", toolsUsed, janusGraphUsed);
-			return merged;
+			return alarmAnalysis;
 		}
 		catch (Exception e) {
 			List<String> toolsUsed = AgentConsole.endToolTracking();
-			boolean janusGraphUsed = toolsUsed.stream().anyMatch("NetworkTopologyRca"::equals)
-					|| AgentConsole.isJanusGraphEvidenceCalled();
+			boolean janusGraphUsed = AgentConsole.isJanusGraphEvidenceCalled();
 			log.info("[NOVA] Tools used this turn before failure: {} | JanusGraph topology RCA invoked: {}", toolsUsed, janusGraphUsed);
 			return "[Error during deterministic alarm orchestration: " + e.getMessage() + "]";
 		}
 	}
 
-	private static String runDeterministicConnectivityFlow(String userInput,
+	private static String runDeterministicAlarmHierarchyFlow(String userInput,
+			DatabaseTools databaseTools,
 			NetworkTopologyRcaTool networkTopologyRcaTool) {
 		AgentConsole.beginToolTracking();
 		try {
 			if (networkTopologyRcaTool == null) {
 				List<String> toolsUsed = AgentConsole.endToolTracking();
 				log.info("[NOVA] Tools used this turn: {} | JanusGraph topology RCA invoked: false", toolsUsed);
-				return "JanusGraph topology RCA is disabled or unavailable. Enable `janusgraph.enabled=true` and verify Gremlin connectivity.";
+				return "JanusGraph topology service is unavailable. Enable JanusGraph to fetch hierarchy, interfaces, and links.";
 			}
-
-			List<String> seeds = extractConnectivitySeeds(userInput);
-			if (seeds.isEmpty()) {
-				List<String> toolsUsed = AgentConsole.endToolTracking();
-				log.info("[NOVA] Tools used this turn: {} | JanusGraph topology RCA invoked: false", toolsUsed);
-				return "I could not extract a node/IP from your query. Please provide an NE_NAME, nodeId, or IPv4 (e.g., `172.31.31.131`).";
-			}
-
-			String alarmingNodeIds = String.join(", ", seeds);
-			String context = "deterministic-connectivity-route | userRequest='" + userInput + "'";
-			log.info("[NOVA][Routing] JanusGraph deterministic request -> tool=NetworkTopologyRca alarmingNodeIds='{}' context='{}'",
-					alarmingNodeIds, context);
-			String topology = networkTopologyRcaTool.analyzeTopologyRootCause(alarmingNodeIds, context);
-
+			String seedSql = buildAlarmHierarchySeedSql();
+			String alarmSeedData = databaseTools.executeQuery(seedSql);
+			String context = "alarm-hierarchy-topology | userRequest='" + userInput + "'";
+			String topology = networkTopologyRcaTool.analyzeTopologyForAlarmMarkdown(alarmSeedData, context, false);
 			List<String> toolsUsed = AgentConsole.endToolTracking();
-			boolean janusGraphUsed = toolsUsed.stream().anyMatch("NetworkTopologyRca"::equals)
-					|| AgentConsole.isJanusGraphEvidenceCalled();
+			boolean janusGraphUsed = AgentConsole.isJanusGraphEvidenceCalled();
 			log.info("[NOVA] Tools used this turn: {} | JanusGraph topology RCA invoked: {}", toolsUsed, janusGraphUsed);
 			return topology;
 		}
 		catch (Exception e) {
 			List<String> toolsUsed = AgentConsole.endToolTracking();
-			boolean janusGraphUsed = toolsUsed.stream().anyMatch("NetworkTopologyRca"::equals)
-					|| AgentConsole.isJanusGraphEvidenceCalled();
+			boolean janusGraphUsed = AgentConsole.isJanusGraphEvidenceCalled();
 			log.info("[NOVA] Tools used this turn before failure: {} | JanusGraph topology RCA invoked: {}", toolsUsed, janusGraphUsed);
-			return "[Error during deterministic topology connectivity orchestration: " + e.getMessage() + "]";
+			return "[Error during deterministic alarm hierarchy topology flow: " + e.getMessage() + "]";
 		}
 	}
 
@@ -511,25 +462,6 @@ public class NovaApplication {
 		}
 	}
 
-	private static List<String> extractConnectivitySeeds(String input) {
-		if (input == null || input.isBlank()) return List.of();
-
-		LinkedHashSet<String> seeds = new LinkedHashSet<>();
-		Matcher ipMatcher = Pattern.compile("\\b\\d{1,3}(?:\\.\\d{1,3}){3}\\b").matcher(input);
-		while (ipMatcher.find()) {
-			seeds.add(ipMatcher.group().trim());
-		}
-
-		Matcher quotedMatcher = Pattern.compile("[\"'`]{1}([^\"'`]{2,})[\"'`]{1}").matcher(input);
-		while (quotedMatcher.find()) {
-			String value = quotedMatcher.group(1).trim();
-			if (!value.isBlank()) {
-				seeds.add(value);
-			}
-		}
-
-		return List.copyOf(seeds);
-	}
 
 	private static String extractFirstIpv4(String input) {
 		if (input == null || input.isBlank()) return null;
@@ -552,105 +484,16 @@ public class NovaApplication {
 				|| lower.contains("pm ");
 	}
 
-	private static String buildAlarmFetchSql(DataSource dataSource) {
-		Set<String> columns = getTableColumns(dataSource, "ALARM");
-		String statusCol = firstExisting(columns, "alarm_status", "status", "current_status");
-		String tsCol = firstExisting(columns, "last_event_time", "event_time", "updated_at", "raised_time", "created_at", "timestamp");
-
-		StringBuilder sql = new StringBuilder("SELECT * FROM ALARM");
-		if (statusCol != null) {
-			sql.append(" WHERE ").append(statusCol).append(" IN ('OPEN','REOPEN')");
-		}
-		if (tsCol != null) {
-			sql.append(" ORDER BY ").append(tsCol).append(" DESC");
-		}
-		String finalSql = sql.toString();
-		log.info("[NOVA] Deterministic alarm SQL built: {}", finalSql);
-		return finalSql;
+	private static String buildAlarmFetchSql() {
+		String sql = DEFAULT_ALARM_FILTER_SQL;
+		log.info("[NOVA] Deterministic alarm SQL built: {}", sql.replace('\n', ' '));
+		return sql;
 	}
 
-	private static Set<String> getTableColumns(DataSource dataSource, String tableName) {
-		Set<String> cols = new HashSet<>();
-		try (Connection conn = dataSource.getConnection()) {
-			DatabaseMetaData meta = conn.getMetaData();
-			String schema = conn.getSchema();
-			try (ResultSet rs = meta.getColumns(null, schema, tableName, "%")) {
-				while (rs.next()) {
-					String col = rs.getString("COLUMN_NAME");
-					if (col != null) cols.add(col.toLowerCase(Locale.ROOT));
-				}
-			}
-		}
-		catch (SQLException e) {
-			log.warn("[NOVA] Could not read table metadata for {}: {}", tableName, e.getMessage());
-		}
-		return cols;
-	}
-
-	private static String firstExisting(Set<String> columns, String... candidates) {
-		for (String candidate : candidates) {
-			if (columns.contains(candidate.toLowerCase(Locale.ROOT))) {
-				return candidate;
-			}
-		}
-		return null;
-	}
-
-	private static List<String> extractDistinctFromMarkdownTable(String markdownTable, List<String> headerCandidates) {
-		if (markdownTable == null || markdownTable.isBlank()) return List.of();
-		String[] lines = markdownTable.split("\\r?\\n");
-		List<String> rows = new ArrayList<>();
-		for (String line : lines) {
-			String t = line.trim();
-			if (t.startsWith("|") && t.endsWith("|")) {
-				rows.add(t);
-			}
-		}
-		if (rows.size() < 3) return List.of();
-
-		List<String> headers = splitMarkdownRow(rows.get(0));
-		int idx = -1;
-		for (String candidate : headerCandidates) {
-			String c = normalizeHeader(candidate);
-			for (int i = 0; i < headers.size(); i++) {
-				String h = normalizeHeader(headers.get(i));
-				if (h.equals(c) || h.contains(c)) {
-					idx = i;
-					break;
-				}
-			}
-			if (idx >= 0) break;
-		}
-		if (idx < 0) return List.of();
-
-		Set<String> distinct = new LinkedHashSet<>();
-		for (int i = 2; i < rows.size(); i++) {
-			String row = rows.get(i);
-			if (row.contains("---")) continue;
-			List<String> cells = splitMarkdownRow(row);
-			if (idx >= cells.size()) continue;
-			String value = cells.get(idx).replace("**", "").trim();
-			if (value.isBlank() || "null".equalsIgnoreCase(value)) continue;
-			distinct.add(value);
-			if (distinct.size() >= 80) break;
-		}
-		return List.copyOf(distinct);
-	}
-
-	private static List<String> splitMarkdownRow(String row) {
-		if (row == null || row.isBlank()) return List.of();
-		String t = row.trim();
-		if (!t.startsWith("|") || !t.endsWith("|")) return List.of();
-		String core = t.substring(1, t.length() - 1);
-		String[] parts = core.split(Pattern.quote("|"), -1);
-		List<String> out = new ArrayList<>(parts.length);
-		for (String part : parts) out.add(part.trim());
-		return out;
-	}
-
-	private static String normalizeHeader(String s) {
-		if (s == null) return "";
-		return s.toLowerCase().replaceAll("[^a-z0-9]", "");
+	private static String buildAlarmHierarchySeedSql() {
+		String sql = DEFAULT_ALARM_HIERARCHY_SEED_SQL;
+		log.info("[NOVA] Alarm hierarchy seed SQL built: {}", sql.replace('\n', ' '));
+		return sql;
 	}
 
 	private static String shrinkAlarmDataForLlm(String raw, int maxChars) {

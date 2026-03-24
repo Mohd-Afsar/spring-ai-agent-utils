@@ -29,6 +29,12 @@ public class NetworkTopologyRcaTool {
 
 	/** First N characters of JanusGraph-derived payloads logged at INFO for operator visibility. */
 	private static final int JANUS_TO_LLM_LOG_PREVIEW_CHARS = 2500;
+	/** Hard cap for interactive topology requests to keep latency bounded. */
+	private static final int INTERACTIVE_MAX_TOPOLOGY_SEEDS = 40;
+	/** Skip expensive JSON subgraph generation when seed set is large. */
+	private static final int SKIP_JSON_SUBGRAPH_SEED_THRESHOLD = 50;
+	/** Tight neighbor cap in large-seed mode to avoid per-node fanout cost. */
+	private static final int LARGE_SEED_MAX_NEIGHBORS = 3;
 
 	private final GraphTopologyService graphTopologyService;
 	private final NetworkIntelligenceTool networkIntelligenceTool;
@@ -214,6 +220,11 @@ public class NetworkTopologyRcaTool {
 		AgentConsole.toolStarted("NetworkTopologyRca");
 		try {
 			AgentConsole.markJanusGraphEvidenceCalled();
+			if (nodeIds.size() > INTERACTIVE_MAX_TOPOLOGY_SEEDS) {
+				log.warn("[NetworkTopologyRca] Interactive seed cap applied for latency: {} -> {}",
+						nodeIds.size(), INTERACTIVE_MAX_TOPOLOGY_SEEDS);
+				nodeIds = new ArrayList<>(nodeIds.subList(0, INTERACTIVE_MAX_TOPOLOGY_SEEDS));
+			}
 			int beforeEquipmentRollup = nodeIds.size();
 			if (rollUpInterfaceAlarmsToParentEquipment) {
 				int equipCap = maxAlarmingNodeIds == Integer.MAX_VALUE ? 0 : maxAlarmingNodeIds;
@@ -235,18 +246,15 @@ public class NetworkTopologyRcaTool {
 				llmProlog = buildLlmRcaProlog(prologSeeds, prologResolved != null ? prologResolved : List.of(), nodeIds,
 						hitMysqlResolveCap, mysqlResolveCap);
 			}
-			String inventoryMarkdown = graphTopologyService.formatInventoryTopologyReport(
-					nodeIds, maxChildrenPerNodeInReport, maxLinkNeighborsPerNode);
-			String topologyJson = graphTopologyService.formatAlarmTopologySubgraphJson(
-					nodeIds, maxChildrenPerNodeInReport, maxLinkNeighborsPerNode);
-			String jsonFence = "\n\n### Alarm-focused topology (JSON)\n\n```json\n" + topologyJson + "\n```\n";
-			String structure = inventoryMarkdown + jsonFence;
+			boolean largeSeedMode = nodeIds.size() >= SKIP_JSON_SUBGRAPH_SEED_THRESHOLD;
+			int effectiveNeighbors = largeSeedMode ? Math.min(maxLinkNeighborsPerNode, LARGE_SEED_MAX_NEIGHBORS)
+					: maxLinkNeighborsPerNode;
+			String structure = graphTopologyService.formatActiveLinkHierarchyReport(nodeIds);
 			String topologyReport = prependContext(structure, investigationContext, nodeIds, distinctOrPreTruncBound,
 					neCountAtPipelineEntry, llmProlog, rollUpInterfaceAlarmsToParentEquipment);
 
-			log.info("[JanusGraph→LLM] Topology sections — inventoryMarkdownChars={}, subgraphJsonChars={}, "
-							+ "structureChars={}, fullToolPayloadChars={} (prolog/context/footer included)",
-					inventoryMarkdown.length(), topologyJson.length(), structure.length(), topologyReport.length());
+			log.info("[JanusGraph→LLM] Topology sections — structureChars={}, fullToolPayloadChars={} (prolog/context/footer included)",
+					structure.length(), topologyReport.length());
 			log.info("[JanusGraph→LLM] Topology tool payload preview (first {} of {} chars):\n{}",
 					Math.min(JANUS_TO_LLM_LOG_PREVIEW_CHARS, topologyReport.length()),
 					topologyReport.length(),

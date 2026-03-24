@@ -122,6 +122,13 @@ public class GraphTopologyService {
 	private int inventoryMaxInterfacesForNeighborWalk;
 
 	/**
+	 * Fast mode for alarm-topology use-cases:
+	 * only hierarchy and 1-hop neighbor equipment are rendered.
+	 */
+	@Value("${nova.topology.fast-hierarchy-neighbors-only:true}")
+	private boolean fastHierarchyNeighborsOnly;
+
+	/**
 	 * {@code minimal} — inventory markdown: NE id, parent chain, interface {@code nodeId}s, 1-hop neighbor equipment only;
 	 * alarm JSON vertices: {@code nodeId} + {@code neType} only. {@code full} — verbose markdown + rich JSON (vendor, geo, …).
 	 */
@@ -1223,6 +1230,9 @@ public class GraphTopologyService {
 		List<String> distinct = (invCap >= Integer.MAX_VALUE - 1)
 				? nodeStream.toList()
 				: nodeStream.limit(invCap).toList();
+		if (fastHierarchyNeighborsOnly) {
+			return formatFastHierarchyAndNeighborsReport(distinct, maxNeighborsPerNode);
+		}
 		int maxCh = resolveInventoryFanoutCap(maxChildrenPerNode, softCapChildrenWhenUnlimited);
 		int maxNbr = resolveInventoryFanoutCap(maxNeighborsPerNode, softCapNeighborsWhenUnlimited);
 		StringBuilder sb = new StringBuilder();
@@ -1265,6 +1275,219 @@ public class GraphTopologyService {
 					""");
 		}
 		return sb.toString();
+	}
+
+	/**
+	 * Edge-centric fast topology report using ACTIVE links only.
+	 * Query shape:
+	 * g.E().has("start", within(starts)).has("status","ACTIVE")
+	 * grouped by start -> srcInterface -> [protocol, peerDevice, peerInterface, bandwidth, cktId]
+	 */
+	public String formatActiveLinkHierarchyReport(List<String> starts) {
+		ensureJanusGraphHealth();
+		if (!janusGraphHealthy) {
+			return "## Active link hierarchy\n\nJanusGraph is currently unavailable.";
+		}
+		if (starts == null || starts.isEmpty()) {
+			return "## Active link hierarchy\n\nNo start nodes provided.";
+		}
+		List<String> distinctStarts = starts.stream()
+				.filter(Objects::nonNull)
+				.map(String::trim)
+				.filter(s -> !s.isEmpty())
+				.distinct()
+				.toList();
+		if (distinctStarts.isEmpty()) {
+			return "## Active link hierarchy\n\nNo start nodes provided.";
+		}
+		try {
+			log.info("[JanusGraph][Gremlin][ACTIVE_LINK_HIERARCHY] Query:\n{}",
+					buildActiveLinkHierarchyQueryForLog(distinctStarts));
+			Map<Object, Object> grouped = g.E()
+					.has("start", P.within(distinctStarts))
+					.has("status", "ACTIVE")
+					.group()
+					.by(__.values("start"))
+					.by(__.group()
+							.by(__.values("srcInterface"))
+							.by(__.project("protocol", "peerDevice", "peerInterface", "bandwidth", "cktId")
+									.by(__.values("relation"))
+									.by(__.values("end"))
+									.by(__.values("destInterface"))
+									.by(__.values("srcBandwidth"))
+									.by(__.values("cktId"))
+									.fold()))
+					.next();
+
+			StringBuilder sb = new StringBuilder();
+			sb.append("## Active link hierarchy (edge-driven)\n\n");
+			sb.append("**Requested starts:** ").append(distinctStarts.size()).append("\n\n");
+
+			Map<Object, Object> byStart = grouped;
+			if (byStart == null || byStart.isEmpty()) {
+				log.info("[JanusGraph][Gremlin][ACTIVE_LINK_HIERARCHY] Response: grouped starts=0");
+				sb.append("_No ACTIVE links found for requested starts._\n");
+				return sb.toString();
+			}
+
+			for (String start : distinctStarts) {
+				Object ifaceObj = byStart.get(start);
+				sb.append("### `").append(start).append("`\n\n");
+				if (!(ifaceObj instanceof Map<?, ?> ifaceMap) || ifaceMap.isEmpty()) {
+					sb.append("- _(no ACTIVE links)_\n\n");
+					continue;
+				}
+				for (Map.Entry<?, ?> ifaceEntry : ifaceMap.entrySet()) {
+					String srcIf = Objects.toString(ifaceEntry.getKey(), "UNKNOWN_INTERFACE");
+					sb.append("- **").append(srcIf).append("**\n");
+					Object rowsObj = ifaceEntry.getValue();
+					if (!(rowsObj instanceof List<?> rows) || rows.isEmpty()) {
+						sb.append("  - _(no peer rows)_\n");
+						continue;
+					}
+					for (Object rowObj : rows) {
+						if (!(rowObj instanceof Map<?, ?> row)) continue;
+						String protocol = Objects.toString(row.get("protocol"), "");
+						String peerDevice = Objects.toString(row.get("peerDevice"), "");
+						String peerInterface = Objects.toString(row.get("peerInterface"), "");
+						String bandwidth = Objects.toString(row.get("bandwidth"), "");
+						String cktId = Objects.toString(row.get("cktId"), "");
+						sb.append("  - protocol=`").append(protocol)
+								.append("`, peerDevice=`").append(peerDevice)
+								.append("`, peerInterface=`").append(peerInterface)
+								.append("`, bandwidth=`").append(bandwidth)
+								.append("`, cktId=`").append(cktId).append("`\n");
+					}
+				}
+				sb.append("\n");
+			}
+			String out = sb.toString();
+			log.info("[JanusGraph][Gremlin][ACTIVE_LINK_HIERARCHY] Response: grouped starts={} markdownChars={}",
+					byStart.size(), out.length());
+			if (log.isDebugEnabled()) {
+				log.debug("[JanusGraph][Gremlin][ACTIVE_LINK_HIERARCHY] Response markdown:\n{}", out);
+			}
+			else {
+				int previewChars = Math.min(4000, out.length());
+				log.info("[JanusGraph][Gremlin][ACTIVE_LINK_HIERARCHY] Response preview (first {} chars):\n{}",
+						previewChars, out.substring(0, previewChars));
+			}
+			return out;
+		}
+		catch (Exception e) {
+			log.warn("[JanusGraph] ACTIVE link hierarchy query failed: {}", e.getMessage());
+			return "## Active link hierarchy\n\n[Query error: " + e.getMessage() + "]";
+		}
+	}
+
+	private static String buildActiveLinkHierarchyQueryForLog(List<String> starts) {
+		String withinBlock = starts.stream()
+				.map(s -> "    '" + s.replace("'", "\\'") + "'")
+				.collect(Collectors.joining(",\n"));
+		return """
+				g.E().
+				  has('start', within(
+				%s
+				  )).
+				  has('status','ACTIVE').
+				  group().
+				    by(values('start')).
+				    by(
+				      group().
+				        by(values('srcInterface')).
+				        by(
+				          project(
+				            'protocol',
+				            'peerDevice',
+				            'peerInterface',
+				            'bandwidth',
+				            'cktId'
+				          ).
+				            by(values('relation')).
+				            by(values('end')).
+				            by(values('destInterface')).
+				            by(values('srcBandwidth')).
+				            by(values('cktId')).
+				          fold()
+				        )
+				    )
+				""".formatted(withinBlock);
+	}
+
+	/**
+	 * Optimized inventory output for alarm-driven topology:
+	 * - hierarchy chain (root -> ... -> seed)
+	 * - 1-hop neighbor equipment via OSPF interfaces
+	 *
+	 * Skips heavy sections (full child listing, direct interface edge dumps, verbose prose).
+	 */
+	private String formatFastHierarchyAndNeighborsReport(List<String> nodeIds, int maxNeighborsPerNode) {
+		List<String> distinct = nodeIds == null ? List.of() : nodeIds;
+		int maxNbr = resolveInventoryFanoutCap(maxNeighborsPerNode, softCapNeighborsWhenUnlimited);
+		StringBuilder sb = new StringBuilder();
+		sb.append("## Network hierarchy + 1-hop neighbors\n\n");
+		sb.append("**NEs listed:** ").append(distinct.size()).append("\n\n---\n\n");
+		long t0 = System.currentTimeMillis();
+		for (int i = 0; i < distinct.size(); i++) {
+			String nodeId = distinct.get(i);
+			if (i == 0 || (i + 1) % 25 == 0 || i + 1 == distinct.size()) {
+				log.info("[JanusGraph] Fast topology report progress: {}/{} (elapsedMs={})",
+						i + 1, distinct.size(), System.currentTimeMillis() - t0);
+			}
+			appendFastNodeSection(sb, nodeId, maxNbr);
+		}
+		return sb.toString();
+	}
+
+	private void appendFastNodeSection(StringBuilder sb, String nodeId, int maxNbr) {
+		sb.append("### `").append(nodeId).append("`\n\n");
+		try {
+			// Single traversal for full ancestor chain; also doubles as existence check.
+			List<String> ancestors = g.V().has("nodeId", nodeId)
+					.repeat(__.in("PARENT_OF"))
+					.emit()
+					.values("nodeId")
+					.toList()
+					.stream()
+					.map(Object::toString)
+					.toList();
+			if (ancestors.isEmpty()) {
+				sb.append("- **In JanusGraph:** not found\n\n");
+				return;
+			}
+			Collections.reverse(ancestors);
+			if (ancestors.size() <= 1) {
+				sb.append("- **Hierarchy:** `").append(nodeId).append("` _(root/no parent edge)_\n");
+			}
+			else {
+				sb.append("- **Hierarchy:** ");
+				sb.append(ancestors.stream()
+						.filter(x -> !nodeId.equals(x))
+						.map(x -> "`" + x + "`")
+						.collect(Collectors.joining(" -> ")));
+				sb.append(" -> `").append(nodeId).append("`\n");
+			}
+
+			List<Map<String, Object>> neighbors = adjacentEquipmentViaOspfInterfaces(nodeId, maxNbr);
+			LinkedHashSet<String> eqIds = new LinkedHashSet<>();
+			for (Map<String, Object> row : neighbors) {
+				String id = str(row, "nodeId");
+				if (!id.isBlank() && !nodeId.equals(id)) {
+					eqIds.add(id);
+				}
+			}
+			sb.append("- **1-hop neighbor equipment:** ");
+			if (eqIds.isEmpty()) {
+				sb.append("_(none)_\n\n");
+			}
+			else {
+				sb.append(eqIds.stream().map(x -> "`" + x + "`").collect(Collectors.joining(", "))).append("\n\n");
+			}
+		}
+		catch (Exception e) {
+			log.warn("[JanusGraph] Fast node section failed for nodeId={}: {}", nodeId, e.getMessage());
+			sb.append("- **Error:** ").append(e.getMessage()).append("\n\n");
+		}
 	}
 
 	/**

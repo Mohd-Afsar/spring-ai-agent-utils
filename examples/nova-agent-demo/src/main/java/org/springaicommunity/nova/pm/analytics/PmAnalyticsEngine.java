@@ -5,6 +5,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Locale;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -60,6 +61,7 @@ public class PmAnalyticsEngine {
     private static final double DIP_FACTOR = 0.5;
     // Gradual increase: monotonically rising >= this many points
     private static final int GRADUAL_MIN_POINTS = 4;
+    private static final double EPS = 1e-9;
 
     /**
      * Main entry point. Produces a {@link PmNodeSummary} from enriched PM data.
@@ -116,7 +118,8 @@ public class PmAnalyticsEngine {
             String code = e.getKey();
             double[] values = e.getValue();
             String kpiName = kpiName(code, kpiDetails);
-            detectAnomalies(code, kpiName, values, data, anomalies, staticValues);
+            KpiContext ctx = kpiContext(code, kpiDetails);
+            detectAnomalies(code, kpiName, values, data, anomalies, staticValues, ctx);
         }
         // Sort: CRITICAL first, then by deviation descending
         anomalies.sort(Comparator
@@ -153,21 +156,22 @@ public class PmAnalyticsEngine {
     // -------------------------------------------------------------------------
 
     private void detectAnomalies(String code, String kpiName, double[] values,
-            List<DataEntry> data, List<KpiAnomaly> out, Map<String, Double> staticValues) {
+            List<DataEntry> data, List<KpiAnomaly> out, Map<String, Double> staticValues, KpiContext ctx) {
 
         if (values.length == 0) return;
         double mean = mean(values);
         double peak = max(values);
         double min = min(values);
-        if (mean == 0) return;
+        if (!Double.isFinite(mean) || Math.abs(mean) < EPS) return;
 
         String trend = trend(values);
 
         // Spike
         for (int i = 0; i < values.length; i++) {
-            if (values[i] > SPIKE_FACTOR * mean) {
+            if (!Double.isFinite(values[i])) continue;
+            if (values[i] > ctx.spikeFactor * mean) {
                 out.add(anomaly(code, kpiName, mean, values[i], trend,
-                        KpiAnomaly.AnomalyType.SPIKE, data.get(i).getTime()));
+                        KpiAnomaly.AnomalyType.SPIKE, data.get(i).getTime(), ctx));
                 return; // one anomaly per KPI
             }
         }
@@ -175,12 +179,16 @@ public class PmAnalyticsEngine {
         int run = 0;
         int runStart = -1;
         for (int i = 0; i < values.length; i++) {
-            if (values[i] > SUSTAINED_FACTOR * mean) {
+            if (!Double.isFinite(values[i])) {
+                run = 0;
+                continue;
+            }
+            if (values[i] > ctx.sustainedFactor * mean) {
                 if (run == 0) runStart = i;
                 run++;
                 if (run >= SUSTAINED_MIN_POINTS) {
                     out.add(anomaly(code, kpiName, mean, values[runStart], trend,
-                            KpiAnomaly.AnomalyType.SUSTAINED_HIGH, data.get(runStart).getTime()));
+                            KpiAnomaly.AnomalyType.SUSTAINED_HIGH, data.get(runStart).getTime(), ctx));
                     return;
                 }
             } else {
@@ -189,21 +197,22 @@ public class PmAnalyticsEngine {
         }
         // Dip
         for (int i = 0; i < values.length; i++) {
-            if (values[i] < DIP_FACTOR * mean && mean > 0) {
+            if (!Double.isFinite(values[i])) continue;
+            if (values[i] < ctx.dipFactor * mean && mean > 0) {
                 out.add(anomaly(code, kpiName, mean, values[i], trend,
-                        KpiAnomaly.AnomalyType.DIP, data.get(i).getTime()));
+                        KpiAnomaly.AnomalyType.DIP, data.get(i).getTime(), ctx));
                 return;
             }
         }
         // Gradual increase
         if (values.length >= GRADUAL_MIN_POINTS && isMonotonicallyRising(values, GRADUAL_MIN_POINTS)) {
             out.add(anomaly(code, kpiName, mean, peak, trend,
-                    KpiAnomaly.AnomalyType.GRADUAL_INCREASE, data.get(0).getTime()));
+                    KpiAnomaly.AnomalyType.GRADUAL_INCREASE, data.get(0).getTime(), ctx));
         }
     }
 
     private KpiAnomaly anomaly(String code, String name, double mean, double actual,
-            String trend, KpiAnomaly.AnomalyType type, String detectedAt) {
+            String trend, KpiAnomaly.AnomalyType type, String detectedAt, KpiContext ctx) {
         KpiAnomaly a = new KpiAnomaly();
         a.setKpiCode(code);
         a.setKpiName(name);
@@ -211,17 +220,20 @@ public class PmAnalyticsEngine {
         a.setPeak(round2(actual));
         a.setDeviationPct(mean > 0 ? round2(((actual - mean) / mean) * 100) : 0);
         a.setType(type);
-        a.setSeverity(classifySeverity(type, a.getDeviationPct(), actual));
+        a.setSeverity(classifySeverity(type, a.getDeviationPct(), actual, ctx));
         a.setDetectedAt(detectedAt);
         a.setTrend(trend);
         return a;
     }
 
-    private Severity classifySeverity(KpiAnomaly.AnomalyType type, double deviationPct, double actual) {
+    private Severity classifySeverity(KpiAnomaly.AnomalyType type, double deviationPct, double actual, KpiContext ctx) {
+        double absDev = Math.abs(deviationPct);
         return switch (type) {
-            case SPIKE -> deviationPct > 500 ? Severity.CRITICAL : deviationPct > 200 ? Severity.HIGH : Severity.MEDIUM;
-            case SUSTAINED_HIGH -> actual > 100_000 ? Severity.CRITICAL : actual > 10_000 ? Severity.HIGH : Severity.MEDIUM;
-            case DIP -> Math.abs(deviationPct) > 80 ? Severity.HIGH : Severity.MEDIUM;
+            case SPIKE -> absDev > ctx.criticalDeviationPct ? Severity.CRITICAL
+                    : absDev > ctx.highDeviationPct ? Severity.HIGH : Severity.MEDIUM;
+            case SUSTAINED_HIGH -> absDev > ctx.criticalDeviationPct ? Severity.CRITICAL
+                    : absDev > ctx.highDeviationPct ? Severity.HIGH : Severity.MEDIUM;
+            case DIP -> absDev > ctx.highDeviationPct ? Severity.HIGH : Severity.MEDIUM;
             case GRADUAL_INCREASE -> Severity.LOW;
         };
     }
@@ -316,7 +328,7 @@ public class PmAnalyticsEngine {
             for (int i = 0; i < n; i++) {
                 DataEntry e = data.get(i);
                 Double v = e.getKpis() != null ? e.getKpis().get(code) : null;
-                arr[i] = v != null ? v : 0;
+                arr[i] = v != null ? v : Double.NaN;
             }
             map.put(code, arr);
         }
@@ -326,20 +338,26 @@ public class PmAnalyticsEngine {
     private double mean(double[] v) {
         if (v.length == 0) return 0;
         double s = 0;
-        for (double x : v) s += x;
-        return s / v.length;
+        int n = 0;
+        for (double x : v) {
+            if (Double.isFinite(x)) {
+                s += x;
+                n++;
+            }
+        }
+        return n == 0 ? 0 : s / n;
     }
 
     private double max(double[] v) {
-        double m = Double.MIN_VALUE;
-        for (double x : v) if (x > m) m = x;
-        return m;
+        double m = Double.NEGATIVE_INFINITY;
+        for (double x : v) if (Double.isFinite(x) && x > m) m = x;
+        return Double.isFinite(m) ? m : 0;
     }
 
     private double min(double[] v) {
-        double m = Double.MAX_VALUE;
-        for (double x : v) if (x < m) m = x;
-        return m;
+        double m = Double.POSITIVE_INFINITY;
+        for (double x : v) if (Double.isFinite(x) && x < m) m = x;
+        return Double.isFinite(m) ? m : 0;
     }
 
     private String trend(double[] v) {
@@ -355,12 +373,46 @@ public class PmAnalyticsEngine {
     private boolean isMonotonicallyRising(double[] v, int minPoints) {
         int count = 0;
         for (int i = 1; i < v.length; i++) {
+            if (!Double.isFinite(v[i]) || !Double.isFinite(v[i - 1])) {
+                count = 0;
+                continue;
+            }
             if (v[i] > v[i - 1]) count++;
             else count = 0;
             if (count >= minPoints - 1) return true;
         }
         return false;
     }
+
+    private KpiContext kpiContext(String code, Map<String, KpiFormulaDetails> details) {
+        KpiFormulaDetails d = details != null ? details.get(code) : null;
+        String name = d != null ? d.getKpiName() : "";
+        String group = d != null ? d.getKpiGroup() : "";
+        String type = d != null ? d.getKpiType() : "";
+        String unit = d != null ? d.getKpiUnit() : "";
+        String desc = d != null ? d.getDescription() : "";
+        String haystack = (safe(name) + " " + safe(group) + " " + safe(type) + " " + safe(unit) + " " + safe(desc))
+                .toLowerCase(Locale.ROOT);
+
+        if (haystack.contains("availability") || haystack.contains("drop") || haystack.contains("success rate")) {
+            return new KpiContext(1.6, 1.3, 0.7, 250, 120);
+        }
+        if (haystack.contains("latency") || haystack.contains("delay") || haystack.contains("rtt")) {
+            return new KpiContext(1.8, 1.4, 0.75, 220, 110);
+        }
+        if (haystack.contains("throughput") || haystack.contains("traffic") || haystack.contains("bandwidth")
+                || haystack.contains("utilization")) {
+            return new KpiContext(2.2, 1.6, 0.6, 300, 150);
+        }
+        return new KpiContext(SPIKE_FACTOR, SUSTAINED_FACTOR, DIP_FACTOR, 300, 150);
+    }
+
+    private static String safe(String s) {
+        return s == null ? "" : s;
+    }
+
+    private record KpiContext(double spikeFactor, double sustainedFactor, double dipFactor,
+                              double criticalDeviationPct, double highDeviationPct) {}
 
     private String kpiName(String code, Map<String, KpiFormulaDetails> details) {
         KpiFormulaDetails d = details.get(code);
