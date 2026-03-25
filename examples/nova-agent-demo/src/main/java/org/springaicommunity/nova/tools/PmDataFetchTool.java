@@ -293,11 +293,8 @@ public class PmDataFetchTool {
             // }
 
             String llmOutput = callWithRetry(prompt);
-            String finalBody = reportRequested ? llmOutput : forceConversationalTone(llmOutput);
-            int inputTokensEstimate = Math.max(1, prompt.length() / 4);
-            int outputTokensEstimate = Math.max(1, finalBody.length() / 4);
-            int totalTokensEstimate = inputTokensEstimate + outputTokensEstimate;
-            return "token_usage_total_estimated=" + totalTokensEstimate + "\n" + finalBody;
+            // Return the LLM output verbatim (no truncation, no reformatting, no prefixes).
+            return llmOutput;
 
         } catch (Exception e) {
             log.error("PM analysis failed for node={} from={} to={}", nodeName, from, to, e);
@@ -356,6 +353,12 @@ public class PmDataFetchTool {
         String fromIso = blankToDefault(from, DEFAULT_FROM);
         String toIso = blankToDefault(to, DEFAULT_TO);
 
+        String vendorFromQuery = extractVendorFromUserQuery(userQuery);
+        if (isBlank(vendor) && vendorFromQuery != null && !vendorFromQuery.isBlank()) {
+            v = vendorFromQuery;
+            log.info("[PmAnalysis] Vendor override from userQuery: vendor={}", v);
+        }
+
         ScopeResolution scope = resolveScopeFromUserQuery(userQuery);
         if (isBlank(dataLevel) && scope.dataLevel != null) {
             dl = scope.dataLevel;
@@ -368,6 +371,18 @@ public class PmDataFetchTool {
             log.info("[PmAnalysis] Dynamic scope resolution: {}", scope.reason);
         }
         return new ResolvedPmParams(d, v, t, dl, nn, g, fromIso, toIso);
+    }
+
+    private static String extractVendorFromUserQuery(String userQuery) {
+        if (userQuery == null || userQuery.isBlank()) return null;
+        String q = userQuery.toLowerCase(Locale.ROOT);
+        // Simple deterministic map; extend as needed.
+        if (q.contains("cisco")) return "CISCO";
+        if (q.contains("juniper")) return "JUNIPER";
+        if (q.contains("nokia")) return "NOKIA";
+        if (q.contains("ericsson")) return "ERICSSON";
+        if (q.contains("huawei")) return "HUAWEI";
+        return null;
     }
 
     private ScopeResolution resolveScopeFromUserQuery(String userQuery) {
@@ -487,29 +502,8 @@ public class PmDataFetchTool {
         out = out.replaceAll("(?m)^\\s*What to check next\\s*$", "Next checks:");
         out = out.replaceAll("(?m)^\\s*Recommendations\\s*:?", "Next checks:");
         out = out.replaceAll("\\n{3,}", "\n\n").trim();
-        return enforceMaxTwoSentences(out);
-    }
-
-    private static String enforceMaxTwoSentences(String text) {
-        String compact = text.replace('\n', ' ').replaceAll("\\s{2,}", " ").trim();
-        if (compact.isBlank()) return compact;
-
-        String[] parts = SENTENCE_SPLIT.split(compact);
-        StringBuilder sb = new StringBuilder();
-        int sentenceCount = 0;
-        for (String part : parts) {
-            String s = part == null ? "" : part.trim();
-            if (s.isBlank()) continue;
-            if (sb.length() > 0) sb.append(' ');
-            sb.append(s);
-            sentenceCount++;
-            if (sentenceCount >= 2) break;
-        }
-
-        String result = sb.toString().trim();
-        if (!result.isBlank()) return result;
-        // Fallback when sentence boundaries are unclear.
-        return compact.length() <= 320 ? compact : compact.substring(0, 320).trim() + "...";
+        // Keep it conversational, but do not truncate content.
+        return out;
     }
 
     private static List<String> extractRequestedKpiTerms(String userQuery) {

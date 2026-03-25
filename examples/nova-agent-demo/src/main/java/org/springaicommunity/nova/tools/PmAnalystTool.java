@@ -8,6 +8,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.util.Assert;
 import org.springframework.web.client.HttpClientErrorException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Specialist sub-agent for Performance Management (PM) data analysis.
@@ -22,29 +25,19 @@ import org.springframework.web.client.HttpClientErrorException;
  */
 public class PmAnalystTool {
 
-	private static final String SYSTEM_PROMPT = """
-			You are a senior Telecom NOC analyst.
-
-			You receive a pre-computed PM analytics summary (PmNodeSummary) produced by a Java \
-			analytics engine from Cassandra time-series data. The summary already contains:
-			- Node identity and location
-			- Health status and performance score (0-100)
-			- Dimension scores (availability, throughput, reliability, resource efficiency)
-			- Detected anomalies with KPI name, type (SPIKE/SUSTAINED_HIGH/GRADUAL_INCREASE/DIP), \
-			  severity (CRITICAL/HIGH/MEDIUM/LOW), deviation%, trend, and timestamp
-			- Top busiest time periods
-			- Pre-computed findings
-
-			Your job is to turn this into a clean, professional NOC performance report.
-			Write for a NOC manager who needs to act fast — be direct, precise, and jargon-appropriate.
-
-			Rules:
-			- Use only the values already in the summary — never invent numbers
-			- Lead with the most critical issues
-			- Explain what each anomaly means operationally (not just what the numbers say)
-			- End with 3-5 concrete, prioritised actions with clear owners and timelines
-			- Keep the report concise — a NOC manager should read it in under 2 minutes
-			""";
+	private static final String SYSTEM_PROMPT = loadSystemPrompt();
+	private static String loadSystemPrompt() {
+		try (InputStream in = PmAnalystTool.class.getResourceAsStream("/prompt/PM_ANALYST_SYSTEM_PROMPT.md")) {
+			if (in == null) {
+				return "You are a senior Telecom NOC analyst. Generate a professional PM report using only provided values.";
+			}
+			return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+		}
+		catch (IOException e) {
+			LoggerFactory.getLogger(PmAnalystTool.class).warn("[PmAnalyst] Could not load system prompt: {}", e.getMessage());
+			return "You are a senior Telecom NOC analyst. Generate a professional PM report using only provided values.";
+		}
+	}
 
 	private static final Logger log = LoggerFactory.getLogger(PmAnalystTool.class);
 

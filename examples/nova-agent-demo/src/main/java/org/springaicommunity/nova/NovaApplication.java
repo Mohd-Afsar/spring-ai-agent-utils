@@ -210,7 +210,7 @@ public class NovaApplication {
 
 				.defaultAdvisors(
 					ToolCallAdvisor.builder()
-						.conversationHistoryEnabled(false)
+						.conversationHistoryEnabled(true)
 						.build(),
 					MessageChatMemoryAdvisor.builder(MessageWindowChatMemory.builder().maxMessages(300).build())
 						.order(Ordered.HIGHEST_PRECEDENCE + 1000)
