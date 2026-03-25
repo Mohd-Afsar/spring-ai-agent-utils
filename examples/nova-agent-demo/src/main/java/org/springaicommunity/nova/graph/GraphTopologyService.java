@@ -1303,19 +1303,6 @@ public class GraphTopologyService {
 		try {
 			log.info("[JanusGraph][Gremlin][ACTIVE_LINK_HIERARCHY] Query:\n{}",
 					buildActiveLinkHierarchyQueryForLog(distinctStarts));
-			// Remote GraphTraversalSource (DriverRemoteConnection) is not an embedded JanusGraph instance.
-			// g.getGraph() / configuration() only work in-process after JanusGraphFactory.open(...); here they throw
-			// "The graph is immutable and empty" on the client stub — that is not the server's data.
-			// if (log.isDebugEnabled()) {
-				try {
-					Long anyActive = g.V().count().next();
-					log.info("[JanusGraph][ACTIVE_LINK_HIERARCHY] Server probe via same remote g: "
-							+ "exists edge with status=ACTIVE => {} having count : {}", anyActive != null && anyActive > 0, anyActive);
-				}
-				catch (Exception probeEx) {
-					log.info("[JanusGraph][ACTIVE_LINK_HIERARCHY] Server probe failed: {}", probeEx.getMessage());
-				}
-			// }
 
 			Map<Object, Object> grouped = g.E()
 					.has("start", P.within(distinctStarts))
@@ -1391,6 +1378,51 @@ public class GraphTopologyService {
 			log.warn("[JanusGraph] ACTIVE link hierarchy query failed: {}", e.getMessage());
 			return "## Active link hierarchy\n\n[Query error: " + e.getMessage() + "]";
 		}
+	}
+
+	public String formatActiveLinkHierarchyReportBatched(List<String> starts, int batchSize) {
+		ensureJanusGraphHealth();
+		if (!janusGraphHealthy) {
+			return "## Active link hierarchy\n\nJanusGraph is currently unavailable.";
+		}
+		if (starts == null || starts.isEmpty()) {
+			return "## Active link hierarchy\n\nNo start nodes provided.";
+		}
+		int size = Math.max(1, batchSize);
+		List<String> distinct = starts.stream()
+				.filter(Objects::nonNull)
+				.map(String::trim)
+				.filter(s -> !s.isEmpty())
+				.distinct()
+				.toList();
+		if (distinct.isEmpty()) {
+			return "## Active link hierarchy\n\nNo start nodes provided.";
+		}
+
+		int total = distinct.size();
+		int batches = (total + size - 1) / size;
+		StringBuilder sb = new StringBuilder();
+		sb.append("## Active link hierarchy (edge-driven, batched)\n\n");
+		sb.append("**Total starts:** ").append(total).append(" | **batchSize:** ").append(size)
+				.append(" | **batches:** ").append(batches).append("\n\n");
+
+		long t0 = System.currentTimeMillis();
+		for (int b = 0; b < batches; b++) {
+			int from = b * size;
+			int to = Math.min(total, from + size);
+			List<String> chunk = distinct.subList(from, to);
+			sb.append("### Batch ").append(b + 1).append("/").append(batches)
+					.append(" (seeds ").append(from + 1).append("–").append(to).append(")\n\n");
+			long tb = System.currentTimeMillis();
+			String part = formatActiveLinkHierarchyReport(chunk);
+			long elapsed = Math.max(0L, System.currentTimeMillis() - tb);
+			sb.append(part).append("\n");
+			log.info("[JanusGraph][ACTIVE_LINK_HIERARCHY] Batch {}/{} complete: seeds={} elapsedMs={}",
+					b + 1, batches, chunk.size(), elapsed);
+		}
+		log.info("[JanusGraph][ACTIVE_LINK_HIERARCHY] Batched report complete: totalSeeds={} batches={} elapsedMs={}",
+				total, batches, Math.max(0L, System.currentTimeMillis() - t0));
+		return sb.toString();
 	}
 
 	private static String buildActiveLinkHierarchyQueryForLog(List<String> starts) {

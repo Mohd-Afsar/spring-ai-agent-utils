@@ -12,6 +12,12 @@ import java.util.List;
 import java.util.Optional;
 
 import org.springaicommunity.agent.tools.DatabaseTools;
+import org.springaicommunity.nova.alarm.AlarmFlapAnalyzer;
+import org.springaicommunity.nova.alarm.AlarmMarkdownTableParser;
+import org.springaicommunity.nova.alarm.AlarmEvidenceGuard;
+import org.springaicommunity.nova.alarm.IncidentGrouper;
+import org.springaicommunity.nova.alarm.IncidentSummary;
+import org.springaicommunity.nova.alarm.IncidentSummaryFormatter;
 import org.springaicommunity.nova.graph.GraphTopologyService;
 import org.springaicommunity.nova.tools.AlarmAnalystTool;
 import org.springaicommunity.nova.tools.KPIAnalystTool;
@@ -78,6 +84,9 @@ public class NovaApplication {
 	 */
 	private static final int MAX_WAIT_SECONDS = 30;
 	private static final int MAX_ALARM_DATA_CHARS_FOR_LLM = 100000;
+	private static final int INCIDENT_TOP_N_FOR_LLM = 25;
+	private static final int FLAP_TOP_N_FOR_LLM = 20;
+	private static final int FLAP_MIN_CHANGE_BUCKETS = 3;
 	private static final String DEFAULT_ALARM_FILTER_SQL = """
 			SELECT
 			    ALARM_EXTERNAL_ID,
@@ -391,16 +400,27 @@ public class NovaApplication {
 				log.info("[NOVA] Tools used this turn: {} | JanusGraph topology RCA invoked: false", toolsUsed);
 				return "[Mandatory topology step failed: JanusGraph topology service is unavailable.]";
 			}
+
+			var rows = AlarmMarkdownTableParser.parse(rawAlarmData);
+			List<IncidentSummary> incidents = IncidentGrouper.group(rows);
+			String incidentBlock = IncidentSummaryFormatter.format(incidents, INCIDENT_TOP_N_FOR_LLM);
+			String flapBlock = AlarmFlapAnalyzer.formatFlapSignals(rows, FLAP_MIN_CHANGE_BUCKETS, FLAP_TOP_N_FOR_LLM);
+			var geoTokens = IncidentSummaryFormatter.allowedGeographyTokens(rows);
+			investigationContext += " | alarmRows=" + rows.size() + " incidentGroups=" + incidents.size();
+
 			String hierarchySeedSql = buildAlarmHierarchySeedSql();
 			String hierarchySeedData = databaseTools.executeQuery(hierarchySeedSql);
 			String topologyEvidence = networkTopologyRcaTool.analyzeTopologyForAlarmMarkdown(hierarchySeedData, investigationContext, false);
-			String alarmDataForLlm = shrinkAlarmDataForLlm(rawAlarmData, MAX_ALARM_DATA_CHARS_FOR_LLM);
+			String alarmSampleForLlm = shrinkAlarmDataForLlm(rawAlarmData, Math.min(25_000, MAX_ALARM_DATA_CHARS_FOR_LLM));
+			String alarmDataForLlm = incidentBlock + "\n\n" + flapBlock + "\n\n---\n\n### Raw alarm sample (truncated)\n\n"
+					+ alarmSampleForLlm;
 			if (rawAlarmData != null && alarmDataForLlm.length() < rawAlarmData.length()) {
 				log.warn("[NOVA] Truncated alarm data for AlarmAnalyst. originalChars={} sentChars={}",
 						rawAlarmData.length(), alarmDataForLlm.length());
 			}
 			String alarmAnalysis = alarmAnalystTool.analyzeAlarms(alarmDataForLlm, investigationContext,
 					topologyEvidence);
+			alarmAnalysis = AlarmEvidenceGuard.appendGeographyDisclaimerIfNeeded(alarmAnalysis, geoTokens);
 
 			List<String> toolsUsed = AgentConsole.endToolTracking();
 			boolean janusGraphUsed = AgentConsole.isJanusGraphEvidenceCalled();

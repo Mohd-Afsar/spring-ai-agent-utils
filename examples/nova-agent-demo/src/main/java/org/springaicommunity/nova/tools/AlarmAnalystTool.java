@@ -77,6 +77,9 @@ public class AlarmAnalystTool {
 				### investigationContext
 				%s
 
+				### topologyLinkEvidence
+				%s
+
 				### rawAlarmData
 				%s
 
@@ -84,6 +87,7 @@ public class AlarmAnalystTool {
 				Do not paste the full raw table again.
 				""",
 				investigationContext != null ? investigationContext : "",
+				topologyHierarchyContext != null && !topologyHierarchyContext.isBlank() ? topologyHierarchyContext : "_(no topology evidence supplied)_",
 				rawAlarmData != null ? rawAlarmData : "");
 
 		AgentConsole.toolStarted("AlarmAnalyst");

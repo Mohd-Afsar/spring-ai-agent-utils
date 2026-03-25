@@ -10,7 +10,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 
-import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
@@ -29,8 +28,6 @@ public class NetworkTopologyRcaTool {
 
 	/** First N characters of JanusGraph-derived payloads logged at INFO for operator visibility. */
 	private static final int JANUS_TO_LLM_LOG_PREVIEW_CHARS = 2500;
-	/** Hard cap for interactive topology requests to keep latency bounded. */
-	private static final int INTERACTIVE_MAX_TOPOLOGY_SEEDS = 40;
 	/** Skip expensive JSON subgraph generation when seed set is large. */
 	private static final int SKIP_JSON_SUBGRAPH_SEED_THRESHOLD = 50;
 	/** Tight neighbor cap in large-seed mode to avoid per-node fanout cost. */
@@ -118,52 +115,26 @@ public class NetworkTopologyRcaTool {
 	 */
 	public String analyzeTopologyForAlarmMarkdown(String alarmQueryMarkdown, String investigationContext,
 			boolean runNetworkIntelligence) {
-		int seedExtractCap = maxAlarmingNodeIds == Integer.MAX_VALUE ? Integer.MAX_VALUE : maxAlarmingNodeIds * 8;
-		int resolveCap = maxAlarmingNodeIds == Integer.MAX_VALUE ? Integer.MAX_VALUE : maxAlarmingNodeIds * 4;
 		int graphCap = maxAlarmingNodeIds == Integer.MAX_VALUE ? Integer.MAX_VALUE : maxAlarmingNodeIds;
-		List<String> seeds = AlarmTopologySeedResolver.extractSeedsFromAlarmMarkdown(alarmQueryMarkdown, seedExtractCap);
-		List<String> resolved = List.of();
-		if (dataSource != null && !seeds.isEmpty()) {
-			try {
-				resolved = AlarmTopologySeedResolver.resolveSeedsToNeNames(dataSource, seeds, resolveCap);
-				if (resolved.size() >= resolveCap) {
-					log.warn("[NetworkTopologyRca] MySQL NE_NAME resolution hit cap {} (distinct seeds={}). "
-							+ "Raise nova.topology.max-alarming-nodes or lower alarm row volume; cap scales with table rows.",
-							resolveCap, seeds.size());
-				}
-			}
-			catch (SQLException e) {
-				log.warn("[NetworkTopologyRca] MySQL seed resolution failed: {}", e.getMessage());
-			}
-		}
-		LinkedHashSet<String> full = new LinkedHashSet<>();
-		for (String r : resolved) {
-			if (r != null && !r.isBlank()) {
-				full.add(r.trim());
-			}
-		}
-		for (String s : seeds) {
-			if (s != null && !s.isBlank()) {
-				full.add(s.trim());
-			}
-		}
-		int fullDistinct = full.size();
+		// Use DISTINCT ALARM.ENTITY_NAME seeds directly (no MySQL NETWORK_ELEMENT resolution).
+		// The alarm query input is expected to be: SELECT DISTINCT ENTITY_NAME ... (markdown table).
+		List<String> seeds = AlarmTopologySeedResolver.extractSeedsFromAlarmMarkdown(alarmQueryMarkdown, Integer.MAX_VALUE);
+		int fullDistinct = seeds.size();
 		List<String> nodeIds = new ArrayList<>();
-		for (String x : full) {
+		for (String x : seeds) {
 			if (nodeIds.size() >= graphCap) {
 				break;
 			}
 			nodeIds.add(x);
 		}
 		int neAtEntry = nodeIds.size();
-		boolean hitResolveCap = resolved.size() >= resolveCap;
-		log.info("[NetworkTopologyRca] Alarm-markdown path: seeds={} resolvedToNeName={} distinctMerged={} graphLookups={} resolveCap={}",
-				seeds.size(), resolved.size(), fullDistinct, neAtEntry, resolveCap);
+		log.info("[NetworkTopologyRca] Alarm-markdown path (direct ENTITY_NAME): seeds={} distinctMerged={} graphLookups={}",
+				seeds.size(), fullDistinct, neAtEntry);
 		if (nodeIds.isEmpty()) {
 			return "[NetworkTopologyRca] No topology seeds extracted from alarm markdown (need | table| columns like ENTITY_NAME, HOSTNAME, INTERFACE, IP, …).";
 		}
-		return runTopologyPipeline(nodeIds, fullDistinct, neAtEntry, investigationContext, seeds, resolved,
-				runNetworkIntelligence, hitResolveCap, resolveCap);
+		return runTopologyPipeline(nodeIds, fullDistinct, neAtEntry, investigationContext, seeds, List.of(),
+				runNetworkIntelligence, false, 0);
 	}
 
 	private void logInvocation(List<String> nodeIds, String investigationContext) {
@@ -220,11 +191,6 @@ public class NetworkTopologyRcaTool {
 		AgentConsole.toolStarted("NetworkTopologyRca");
 		try {
 			AgentConsole.markJanusGraphEvidenceCalled();
-			if (nodeIds.size() > INTERACTIVE_MAX_TOPOLOGY_SEEDS) {
-				log.warn("[NetworkTopologyRca] Interactive seed cap applied for latency: {} -> {}",
-						nodeIds.size(), INTERACTIVE_MAX_TOPOLOGY_SEEDS);
-				nodeIds = new ArrayList<>(nodeIds.subList(0, INTERACTIVE_MAX_TOPOLOGY_SEEDS));
-			}
 			int beforeEquipmentRollup = nodeIds.size();
 			if (rollUpInterfaceAlarmsToParentEquipment) {
 				int equipCap = maxAlarmingNodeIds == Integer.MAX_VALUE ? 0 : maxAlarmingNodeIds;
