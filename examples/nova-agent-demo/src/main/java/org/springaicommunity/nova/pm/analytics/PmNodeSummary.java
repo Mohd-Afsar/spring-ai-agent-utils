@@ -7,7 +7,7 @@ import java.util.List;
  *
  * <p>This is what the {@link PmAnalyticsEngine} produces from raw
  * {@link org.springaicommunity.nova.pm.dto.PmDataCompactResponse} data.
- * All heavy number-crunching (mean, trend, anomaly detection, breach checks)
+ * All heavy number-crunching (mean, trend, statistical anomaly detection)
  * happens in Java. The LLM only receives this compact summary — never raw
  * time-series.
  *
@@ -89,7 +89,16 @@ public class PmNodeSummary {
 
         public KpiAnomaly() {}
 
-        public enum AnomalyType { SPIKE, SUSTAINED_HIGH, GRADUAL_INCREASE, DIP }
+        public enum AnomalyType {
+            SPIKE,
+            SUSTAINED_HIGH,
+            GRADUAL_INCREASE,
+            DIP,
+            /** Value above YAML {@code warn-high} / {@code crit-high}. */
+            THRESHOLD_HIGH,
+            /** Value below YAML {@code warn-low} / {@code crit-low}. */
+            THRESHOLD_LOW
+        }
         public enum Severity { LOW, MEDIUM, HIGH, CRITICAL }
 
         public String getKpiCode() { return kpiCode; }

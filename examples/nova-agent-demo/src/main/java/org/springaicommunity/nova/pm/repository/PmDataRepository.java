@@ -12,6 +12,7 @@ import org.springaicommunity.nova.pm.model.PmRecord;
 import org.springframework.data.cassandra.core.CassandraTemplate;
 import org.springframework.data.cassandra.core.query.Criteria;
 import org.springframework.data.cassandra.core.query.Query;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
 import com.datastax.oss.driver.api.core.CqlSession;
@@ -35,12 +36,14 @@ public class PmDataRepository {
 
     private final CassandraTemplate cassandraTemplate;
     private final CqlSession cqlSession;
+    private final JdbcTemplate jdbcTemplate;
 
     private static final Logger log = LoggerFactory.getLogger(PmDataRepository.class);
 
-    public PmDataRepository(CassandraTemplate cassandraTemplate, CqlSession cqlSession) {
+    public PmDataRepository(CassandraTemplate cassandraTemplate, CqlSession cqlSession, JdbcTemplate jdbcTemplate) {
         this.cassandraTemplate = cassandraTemplate;
         this.cqlSession = cqlSession;
+        this.jdbcTemplate = jdbcTemplate;
     }
 
     /**
@@ -135,21 +138,16 @@ public class PmDataRepository {
     }
 
     /**
-     * Returns distinct node names present in a given table for the supplied
-     * domain / vendor / technology / dataLevel combination, across all date
-     * partitions in {@code dates}.
+     * Returns distinct node names ({@code NE_ID}) from MySQL {@code NETWORK_ELEMENT}
+     * for the supplied domain, vendor, technology, and dataLevel ({@code NE_TYPE}).
      *
-     * <p>Cassandra supports {@code SELECT DISTINCT} only on the full partition
-     * key. We therefore issue one scoped query per date and union the results.
-     * This avoids full table scans and stays within the Cassandra driver contract.
-     *
-     * @param tableName  target Cassandra table
-     * @param domain     partition key field
-     * @param vendor     partition key field
-     * @param technology partition key field
-     * @param dataLevel  partition key field
-     * @param dates      list of yyyyMMdd strings covering the requested window
-     * @return distinct node names, ordered by first occurrence
+     * @param tableName   ignored (kept for API compatibility with Cassandra-era callers)
+     * @param domain      {@code DOMAIN}
+     * @param vendor      {@code VENDOR}
+     * @param technology  {@code TECHNOLOGY}
+     * @param dataLevel   {@code NE_TYPE}
+     * @param dates       ignored
+     * @return distinct {@code NE_ID} values, insertion order preserved
      */
     public Set<String> findDistinctNodeNames(
             String tableName,
@@ -159,31 +157,21 @@ public class PmDataRepository {
             String dataLevel,
             List<String> dates) {
 
-        /*
-         * nodename is part of the composite partition key, so Cassandra needs
-         * ALLOW FILTERING to scan without the full key. We use the Cassandra
-         * Java Driver's CqlSession directly to pass a parameterised statement
-         * with ALLOW FILTERING. One query per date partition keeps scans bounded.
-         * LIMIT 10 000: hourly data = ~1 row per node per date, so this supports
-         * up to 10 000 distinct nodes per date window.
-         */
-        String cql = "SELECT nodename FROM " + tableName
-                + " WHERE domain=? AND vendor=? AND technology=? AND datalevel=? AND date=?"
-                + " LIMIT 10000 ALLOW FILTERING";
-
+        String sql = "SELECT DISTINCT NE_ID FROM NETWORK_ELEMENT WHERE DOMAIN = ? AND VENDOR = ? AND NE_TYPE = ? AND TECHNOLOGY = ?";
         Set<String> nodeNames = new LinkedHashSet<>();
-        for (String date : dates) {
-            SimpleStatement stmt = SimpleStatement.newInstance(
-                    cql, domain, vendor, technology, dataLevel, date);
-            cqlSession.execute(stmt).forEach(row -> {
-                String name = row.getString("nodename");
+        try {
+            List<String> result = jdbcTemplate.queryForList(
+                    sql, String.class, domain, vendor, "ROUTER", technology);
+            for (String name : result) {
                 if (name != null && !name.isBlank()) {
                     nodeNames.add(name);
                 }
-            });
+            }
+            log.info("Discovered {} distinct NE_IDs in NETWORK_ELEMENT for {}/{}/{}/{}", 
+                nodeNames.size(), domain, vendor, dataLevel, technology);
+        } catch (Exception e) {
+            log.error("Error querying distinct NE_IDs from NETWORK_ELEMENT", e);
         }
-        log.info("Discovered {} distinct nodes in table={} for {}/{}/{}/{}",
-                nodeNames.size(), tableName, domain, vendor, technology, dataLevel);
         return nodeNames;
     }
 

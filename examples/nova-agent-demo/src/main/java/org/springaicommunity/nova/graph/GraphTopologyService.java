@@ -1303,6 +1303,20 @@ public class GraphTopologyService {
 		try {
 			log.info("[JanusGraph][Gremlin][ACTIVE_LINK_HIERARCHY] Query:\n{}",
 					buildActiveLinkHierarchyQueryForLog(distinctStarts));
+			// Remote GraphTraversalSource (DriverRemoteConnection) is not an embedded JanusGraph instance.
+			// g.getGraph() / configuration() only work in-process after JanusGraphFactory.open(...); here they throw
+			// "The graph is immutable and empty" on the client stub — that is not the server's data.
+			// if (log.isDebugEnabled()) {
+				try {
+					Long anyActive = g.V().count().next();
+					log.info("[JanusGraph][ACTIVE_LINK_HIERARCHY] Server probe via same remote g: "
+							+ "exists edge with status=ACTIVE => {} having count : {}", anyActive != null && anyActive > 0, anyActive);
+				}
+				catch (Exception probeEx) {
+					log.info("[JanusGraph][ACTIVE_LINK_HIERARCHY] Server probe failed: {}", probeEx.getMessage());
+				}
+			// }
+
 			Map<Object, Object> grouped = g.E()
 					.has("start", P.within(distinctStarts))
 					.has("status", "ACTIVE")
@@ -1322,7 +1336,6 @@ public class GraphTopologyService {
 			StringBuilder sb = new StringBuilder();
 			sb.append("## Active link hierarchy (edge-driven)\n\n");
 			sb.append("**Requested starts:** ").append(distinctStarts.size()).append("\n\n");
-
 			Map<Object, Object> byStart = grouped;
 			if (byStart == null || byStart.isEmpty()) {
 				log.info("[JanusGraph][Gremlin][ACTIVE_LINK_HIERARCHY] Response: grouped starts=0");

@@ -21,6 +21,7 @@
 		<java.version>17</java.version>
 		<maven.deploy.skip>true</maven.deploy.skip>
 		<spring-ai.version>2.0.0-SNAPSHOT</spring-ai.version>
+		<janusgraph.version>1.0.0</janusgraph.version>
 	</properties>
 
 	<dependencies>
@@ -73,6 +74,18 @@
 			<groupId>org.apache.tinkerpop</groupId>
 			<artifactId>gremlin-driver</artifactId>
 			<version>3.7.2</version>
+		</dependency>
+
+		<!-- JanusGraph (embedded mode) — lets NOVA open the same janusgraph-cql.properties as gremlin.sh -->
+		<dependency>
+			<groupId>org.janusgraph</groupId>
+			<artifactId>janusgraph-core</artifactId>
+			<version>${janusgraph.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>org.janusgraph</groupId>
+			<artifactId>janusgraph-cql</artifactId>
+			<version>${janusgraph.version}</version>
 		</dependency>
 
 		<!-- Netty DNS resolver for macOS -->

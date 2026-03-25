@@ -241,25 +241,25 @@ public class PmDataFetchTool {
             String responseMode = reportRequested ? "REPORT" : "CONVERSATIONAL";
 
             final String prompt;
-            if (estimatedTokens <= 100_000) {
-                log.info("Raw response ~{} tokens — sending full data directly to LLM (no analytics compression)",
-                        estimatedTokens);
-                prompt = String.format("""
-                        Investigation context: %s
-                        User PM request: %s
-                        Response mode: %s
+            // if (estimatedTokens <= 100_000) {
+            //     log.info("Raw response ~{} tokens — sending full data directly to LLM (no analytics compression)",
+            //             estimatedTokens);
+            //     prompt = String.format("""
+            //             Investigation context: %s
+            //             User PM request: %s
+            //             Response mode: %s
 
-                        Full enriched PM data (JSON):
-                        %s
+            //             Full enriched PM data (JSON):
+            //             %s
 
-                        If response mode is REPORT, generate a formal structured NOC report.
-                        If response mode is CONVERSATIONAL, respond like a friendly senior NOC engineer:
-                        - short actionable explanation
-                        - call out important KPI risks in plain operational language
-                        - suggest practical next checks/steps
-                        - avoid rigid report sections/headings unless explicitly asked
-                        """, reportContext, originalUserQuery.isBlank() ? "(not provided)" : originalUserQuery, responseMode, raw);
-            } else {
+            //             If response mode is REPORT, generate a formal structured NOC report.
+            //             If response mode is CONVERSATIONAL, respond like a friendly senior NOC engineer:
+            //             - short actionable explanation
+            //             - call out important KPI risks in plain operational language
+            //             - suggest practical next checks/steps
+            //             - avoid rigid report sections/headings unless explicitly asked
+            //             """, reportContext, originalUserQuery.isBlank() ? "(not provided)" : originalUserQuery, responseMode, raw);
+            // } else {
                 // ── Step 2b: Run Java analytics engine on each node ───────────────
                 log.info("Raw response ~{} tokens exceeds 100K limit — running analytics engine to compress",
                         estimatedTokens);
@@ -290,7 +290,7 @@ public class PmDataFetchTool {
                         - suggest practical next checks/steps
                         - avoid rigid report sections/headings unless explicitly asked
                         """, reportContext, originalUserQuery.isBlank() ? "(not provided)" : originalUserQuery, responseMode, summaryJson);
-            }
+            // }
 
             String llmOutput = callWithRetry(prompt);
             String finalBody = reportRequested ? llmOutput : forceConversationalTone(llmOutput);

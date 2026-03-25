@@ -1,19 +1,30 @@
 package org.springaicommunity.nova.pm.controller;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
 
+import org.springaicommunity.nova.pm.analytics.KpiSlaBand;
+import org.springaicommunity.nova.pm.analytics.PmKpiSlaThresholdRegistry;
 import org.springaicommunity.nova.pm.dto.PmDataCompactResponse;
 import org.springaicommunity.nova.pm.dto.PmDataEnrichedResponse;
 import org.springaicommunity.nova.pm.dto.PmDataResponse;
 import org.springaicommunity.nova.pm.dto.PmQueryRequest;
+import org.springaicommunity.nova.pm.dto.PmSlaYamlCalibrationResponse;
 import org.springaicommunity.nova.pm.mapper.PmCompactMapper;
 import org.springaicommunity.nova.pm.model.Granularity;
 import org.springaicommunity.nova.pm.service.PmDataEnrichmentService;
 import org.springaicommunity.nova.pm.service.PmDataService;
+import org.springaicommunity.nova.pm.service.PmSlaThresholdCalibrationService;
 import org.springaicommunity.nova.pm.util.PmQueryValidator;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -22,6 +33,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
@@ -37,6 +49,7 @@ import jakarta.validation.constraints.NotNull;
  * <ul>
  *   <li>{@code GET /pm/data} — single-node query via query parameters</li>
  *   <li>{@code POST /pm/data/query} — structured query supporting multiple nodes</li>
+ *   <li>{@code GET|POST /pm/data/sla-thresholds/yaml} — build SLA YAML from the same data as enriched APIs</li>
  * </ul>
  *
  * <h2>Example GET request</h2>
@@ -78,13 +91,22 @@ public class PmDataController {
     private final PmQueryValidator validator;
     private final PmCompactMapper compactMapper;
     private final PmDataEnrichmentService enrichmentService;
+    private final PmSlaThresholdCalibrationService slaCalibrationService;
+    private final PmKpiSlaThresholdRegistry slaRegistry;
+    private final String slaExportPath;
 
     public PmDataController(PmDataService pmDataService, PmQueryValidator validator,
-            PmCompactMapper compactMapper, PmDataEnrichmentService enrichmentService) {
+            PmCompactMapper compactMapper, PmDataEnrichmentService enrichmentService,
+            PmSlaThresholdCalibrationService slaCalibrationService,
+            PmKpiSlaThresholdRegistry slaRegistry,
+            @Value("${pm.sla-thresholds.export-path:}") String slaExportPath) {
         this.pmDataService = pmDataService;
         this.validator = validator;
         this.compactMapper = compactMapper;
         this.enrichmentService = enrichmentService;
+        this.slaCalibrationService = slaCalibrationService;
+        this.slaRegistry = slaRegistry;
+        this.slaExportPath = slaExportPath;
     }
 
     /**
@@ -171,6 +193,62 @@ public class PmDataController {
                 granularity, from, to, kpiCodes, page, size);
 
         return ResponseEntity.ok(enrichmentService.enrich(pmData));
+    }
+
+    /**
+     * Builds {@code pm/kpi-sla-thresholds.yaml} content from the same PM fetch as {@link #getEnrichedData},
+     * using observed min/max per KPI across the window (plus headroom — same rules as
+     * {@code scripts/calibrate_pm_sla_yaml.py}).
+     *
+     * @param persist       if true, writes YAML to {@code pm.sla-thresholds.export-path} (must be configured)
+     * @param applyRuntime  if true, updates the in-memory {@link PmKpiSlaThresholdRegistry} immediately
+     */
+    @GetMapping("/sla-thresholds/yaml")
+    public ResponseEntity<PmSlaYamlCalibrationResponse> buildSlaYamlFromEnrichedGet(
+            @RequestParam String domain,
+            @RequestParam String vendor,
+            @RequestParam String technology,
+            @RequestParam(required = false) String dataLevel,
+            @RequestParam(required = false) String nodeName,
+            @RequestParam @NotNull Granularity granularity,
+            @RequestParam @NotNull Instant from,
+            @RequestParam @NotNull Instant to,
+            @RequestParam(required = false) Set<String> kpiCodes,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "500") int size,
+            @RequestParam(defaultValue = "false") boolean persist,
+            @RequestParam(defaultValue = "true") boolean applyRuntime) {
+
+        validator.validateGetParams(domain, vendor, technology, nodeName, from, to, size);
+
+        PmDataResponse pmData = pmDataService.getData(
+                domain, vendor, technology, dataLevel, nodeName,
+                granularity, from, to, kpiCodes, page, size);
+
+        PmDataEnrichedResponse enriched = enrichmentService.enrich(pmData);
+        return ResponseEntity.ok(calibrateResponse(List.of(enriched), persist, applyRuntime));
+    }
+
+    /**
+     * Multi-node: same body as {@link #queryEnrichedData}; aggregates KPI values across all returned nodes
+     * to produce one merged SLA YAML.
+     */
+    @PostMapping("/sla-thresholds/yaml")
+    public ResponseEntity<PmSlaYamlCalibrationResponse> buildSlaYamlFromEnrichedPost(
+            @RequestBody @Valid PmQueryRequest request,
+            @RequestParam(defaultValue = "false") boolean persist,
+            @RequestParam(defaultValue = "true") boolean applyRuntime) {
+
+        validator.validate(request);
+
+        List<PmDataResponse> responses = pmDataService.queryData(request);
+        if (responses.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "No PM data for query — cannot calibrate SLA YAML");
+        }
+        List<PmDataEnrichedResponse> enriched = responses.stream()
+                .map(enrichmentService::enrich)
+                .toList();
+        return ResponseEntity.ok(calibrateResponse(enriched, persist, applyRuntime));
     }
 
     /**
@@ -278,6 +356,47 @@ public class PmDataController {
         SortedSet<String> nodes = pmDataService.discoverNodes(
                 domain, vendor, technology, dataLevel, granularity, from, to);
         return ResponseEntity.ok(nodes);
+    }
+
+    private PmSlaYamlCalibrationResponse calibrateResponse(List<PmDataEnrichedResponse> enriched,
+            boolean persist, boolean applyRuntime) {
+        Map<String, KpiSlaBand> bands = slaCalibrationService.deriveBands(enriched);
+        if (bands.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "No finite KPI samples in enriched data — cannot build SLA YAML");
+        }
+        String yaml = slaCalibrationService.formatYaml(bands);
+        PmSlaYamlCalibrationResponse r = new PmSlaYamlCalibrationResponse();
+        r.setYaml(yaml);
+        r.setKpiCount(bands.size());
+        r.setNodeCount(enriched.size());
+        r.setNodeSummaries(slaCalibrationService.summarizeNodes(enriched));
+        r.setAppliedToRuntime(false);
+        r.setPersistedToFile(false);
+        if (applyRuntime) {
+            slaRegistry.replaceAll(bands);
+            r.setAppliedToRuntime(true);
+        }
+        if (persist) {
+            if (slaExportPath == null || slaExportPath.isBlank()) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "Set property pm.sla-thresholds.export-path to persist SLA YAML to disk");
+            }
+            Path path = Path.of(slaExportPath).toAbsolutePath().normalize();
+            try {
+                if (path.getParent() != null) {
+                    Files.createDirectories(path.getParent());
+                }
+                Files.writeString(path, yaml, StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                        "Failed to write SLA YAML: " + e.getMessage(), e);
+            }
+            r.setPersistedToFile(true);
+            r.setPersistedPath(path.toString());
+            r.setMessage("YAML written to " + path);
+        }
+        return r;
     }
 
 }

@@ -19,16 +19,19 @@ import org.springaicommunity.nova.tools.NetworkIntelligenceTool;
 import org.springaicommunity.nova.tools.NetworkTopologyRcaTool;
 import org.springaicommunity.nova.tools.PmDataFetchTool;
 import org.springaicommunity.nova.tools.ReportFormatterTool;
+import org.springaicommunity.nova.config.JanusGraphClientProperties;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.client.advisor.ToolCallAdvisor;
 import org.springframework.ai.chat.memory.MessageWindowChatMemory;
+import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
 import org.springframework.core.io.Resource;
@@ -60,6 +63,7 @@ import org.slf4j.LoggerFactory;
  * @author Spring AI Community
  */
 @SpringBootApplication
+@EnableConfigurationProperties(JanusGraphClientProperties.class)
 public class NovaApplication {
 
 	private static final Logger log = LoggerFactory.getLogger(NovaApplication.class);
@@ -133,9 +137,15 @@ public class NovaApplication {
 			@Value("${nova.topology.max-link-neighbors-per-node:25}") int novaTopologyMaxLinkNeighbors,
 			@Autowired DataSource dataSource,
 			org.springaicommunity.nova.pm.analytics.PmAnalyticsEngine analyticsEngine,
-			Optional<GraphTopologyService> graphTopologyService) {
+			Optional<GraphTopologyService> graphTopologyService,
+			@Autowired(required = false) GraphTraversalSource graphTraversalSource,
+			@Value("${janusgraph.startup-diagnostics.enabled:true}") boolean janusStartupDiagnostics,
+			JanusGraphClientProperties janusGraphClientProperties) {
 
 	return args -> {
+		// Startup counts/logging are handled by JanusGraphConfig's ApplicationRunner
+		// to keep boot diagnostics co-located with the Gremlin client configuration.
+
 		System.out.println("--------------------------------");
 		System.out.println("agentModel: " + agentModel);
 		System.out.println("pmApiBaseUrl: " + pmApiBaseUrl);
@@ -447,7 +457,7 @@ public class NovaApplication {
 					null, // granularity -> default HOURLY
 					null, // from -> configured fixed default
 					null, // to -> configured fixed default
-					userInput // response mode routing (report vs conversational)
+					userInput // KPI hints + report vs conversational
 			);
 			List<String> toolsUsed = AgentConsole.endToolTracking();
 			log.info("[NOVA] Tools used this turn: {} | JanusGraph topology RCA invoked: {}",
@@ -519,4 +529,5 @@ public class NovaApplication {
 		return sb.toString();
 	}
 
+	
 }
