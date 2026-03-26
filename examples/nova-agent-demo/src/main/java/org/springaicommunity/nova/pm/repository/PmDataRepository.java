@@ -77,6 +77,7 @@ public class PmDataRepository {
             Instant to,
             int limit) {
 
+        logCassandraCqlSingle(tableName, domain, vendor, technology, dataLevel, date, nodeName, from, to, limit);
         Query query = Query.query(
                 Criteria.where("domain").is(domain),
                 Criteria.where("vendor").is(vendor),
@@ -120,6 +121,7 @@ public class PmDataRepository {
             return List.of();
         }
 
+        logCassandraCqlMulti(tableName, domain, vendor, technology, dataLevel, date, cleaned, from, to, limit);
         Query query = Query.query(
                 Criteria.where("domain").is(domain),
                 Criteria.where("vendor").is(vendor),
@@ -190,6 +192,7 @@ public class PmDataRepository {
             Instant from,
             Instant to) {
 
+        logCassandraCqlSingle(tableName, domain, vendor, technology, dataLevel, date, nodeName, from, to, -1);
         Query query = Query.query(
                 Criteria.where("domain").is(domain),
                 Criteria.where("vendor").is(vendor),
@@ -204,6 +207,27 @@ public class PmDataRepository {
             .inTable(tableName)
             .matching(query)
             .count();
+    }
+
+    private void logCassandraCqlSingle(String tableName, String domain, String vendor, String technology,
+            String dataLevel, String date, String nodeName, Instant from, Instant to, int limit) {
+        String cql = "SELECT * FROM " + tableName
+                + " WHERE domain=? AND vendor=? AND technology=? AND datalevel=? AND date=? AND nodename=?"
+                + " AND timestamp>=? AND timestamp<=?"
+                + (limit > 0 ? " LIMIT ?" : "");
+        log.info("========cassandra_cql start=========\n{}\nparams=[domain={}, vendor={}, technology={}, datalevel={}, date={}, nodename={}, from={}, to={}{}]\n========cassandra_cql end=========",
+                cql, domain, vendor, technology, dataLevel, date, nodeName, from, to, (limit > 0 ? ", limit=" + limit : ""));
+    }
+
+    private void logCassandraCqlMulti(String tableName, String domain, String vendor, String technology,
+            String dataLevel, String date, List<String> nodeNames, Instant from, Instant to, int limit) {
+        String cql = "SELECT * FROM " + tableName
+                + " WHERE domain=? AND vendor=? AND technology=? AND datalevel=? AND date=? AND nodename IN ?"
+                + " AND timestamp>=? AND timestamp<=?"
+                + (limit > 0 ? " LIMIT ?" : "");
+        log.info("========cassandra_cql start=========\n{}\nparams=[domain={}, vendor={}, technology={}, datalevel={}, date={}, nodeNames(size)={}, from={}, to={}{}]\n========cassandra_cql end=========",
+                cql, domain, vendor, technology, dataLevel, date, (nodeNames == null ? 0 : nodeNames.size()), from, to,
+                (limit > 0 ? ", limit=" + limit : ""));
     }
 
 }

@@ -32,13 +32,12 @@ Analyse the provided performance data and produce the following:
    - Short-term (24–48 hrs): capacity actions, HW checks, config changes
    - Long-term: feed into capacity planning or O&M
 
-7. **Correlation with Alarms**: Note if any performance degradation 
-   correlates with active alarms in the network. Avoid duplicate root 
-   cause analysis — refer to alarm report where relevant.
-
-8. **Benchmarking**: Compare current performance against: (a) last 7-day 
-   average, (b) same time last week, (c) defined SLA targets — wherever 
-   data is available.
+Evidence rules (must follow):
+- Use ONLY the values present in the provided data/summary.
+- Do NOT estimate, approximate, or invent benchmarking baselines.
+  unless those baselines are explicitly present in the provided data.
+- Mention SLA targets ONLY when explicit target/threshold values are present in the provided data.
+  If targets are missing, explicitly state that targets were not provided.
 
 Write like a NOC performance shift handover report. Be data-driven, 
 and prescriptive. Avoid vague language like "performance is slightly degraded" — 

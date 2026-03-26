@@ -12,6 +12,12 @@ import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.stream.Collectors;
 
 import javax.sql.DataSource;
 
@@ -46,44 +52,24 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 public class PmDataFetchTool {
 
     private static final Logger log = LoggerFactory.getLogger(PmDataFetchTool.class);
+    private static final int MAX_LLM_INPUT_TOKENS_ESTIMATE = 18_000;
+    private static final int DEFAULT_TOP_N_NODES_FOR_LLM = 80;
+    private static final int DEFAULT_TOP_N_ANOMALIES_FOR_LLM = 200;
 
-    private static final String ANALYST_SYSTEM_PROMPT = """
-            You are a senior Telecom NOC analyst.
+    private static final String ANALYST_SYSTEM_PROMPT = loadSystemPrompt();
 
-            You receive a pre-computed PM analytics summary produced by a Java analytics engine \
-            from Cassandra time-series data. The summary already contains:
-            - Node identity and location
-            - Health status and performance score (0-100)
-            - Dimension scores (availability, throughput, reliability, resource efficiency)
-            - Detected anomalies with KPI name, type (SPIKE/SUSTAINED_HIGH/GRADUAL_INCREASE/DIP), \
-              severity (CRITICAL/HIGH/MEDIUM/LOW), deviation%, trend, and timestamp
-            - Top busiest time periods
-            - Pre-computed findings
-
-            You MUST follow the caller-provided "Response mode" exactly:
-            - REPORT: produce a clean, professional NOC performance report.
-            - CONVERSATIONAL: do NOT produce a formal report. Reply like a friendly senior NOC engineer in natural dialogue.
-
-            For CONVERSATIONAL mode:
-            - Use plain spoken, operational language.
-            - Keep it very concise and action-oriented.
-            - STRICT: Respond in 1 to 2 sentences only.
-            - No formal report sections, no markdown tables, no "Executive Summary"/"Recommendations" headings.
-            - No long bullets or multi-section formatting.
-            - Include practical next checks an on-shift engineer can run immediately.
-
-            For REPORT mode:
-            - Structured report style is allowed.
-
-            Write for a NOC manager/engineer who needs to act fast — be direct, precise, and jargon-appropriate.
-
-            Rules (always):
-            - Use only the values already in the summary — never invent numbers
-            - Lead with the most critical issues
-            - Explain what each anomaly means operationally, not just the numbers
-            - End with concrete, prioritised actions
-            - Keep output concise
-            """;
+    private static String loadSystemPrompt() {
+        try (InputStream in = PmDataFetchTool.class.getResourceAsStream("/prompt/PM_ANALYST_SYSTEM_PROMPT.md")) {
+            if (in == null) {
+                return "You are a senior Telecom NOC analyst. Produce a structured Performance Analysis Report using only provided values.";
+            }
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        catch (IOException e) {
+            LoggerFactory.getLogger(PmDataFetchTool.class).warn("[PmAnalysis] Could not load system prompt: {}", e.getMessage());
+            return "You are a senior Telecom NOC analyst. Produce a structured Performance Analysis Report using only provided values.";
+        }
+    }
 
     private static final int MAX_RETRIES = 4;
     private static final String DEFAULT_DOMAIN = "TRANSPORT";
@@ -167,8 +153,11 @@ public class PmDataFetchTool {
             String originalUserQuery = userQuery == null ? "" : userQuery.trim();
             boolean reportRequested = isReportRequested(originalUserQuery);
             List<String> requestedKpiTerms = extractRequestedKpiTerms(originalUserQuery);
-            Set<String> requestedKpiCodes = resolveKpiCodesForTerms(
-                    requestedKpiTerms, domain, vendor, technology);
+            boolean unfilteredAllCombos = isBlank(domain) && isBlank(vendor) && isBlank(technology)
+                    && (nodeName == null || nodeName.isBlank());
+            Set<String> requestedKpiCodes = unfilteredAllCombos
+                    ? Set.of()
+                    : resolveKpiCodesForTerms(requestedKpiTerms, domain, vendor, technology);
 
             boolean singleNode = nodeName != null && !nodeName.isBlank();
 
@@ -195,38 +184,69 @@ public class PmDataFetchTool {
                 responses = List.of(objectMapper.readValue(raw,
                         org.springaicommunity.nova.pm.dto.PmDataEnrichedResponse.class));
             } else {
-                String body = String.format(
-                        "{\"domain\":\"%s\",\"vendor\":\"%s\",\"technology\":\"%s\","
-                        + "\"dataLevel\":\"%s\",\"granularity\":\"%s\",\"kpiCodes\":%s,"
-                        + "\"timeRange\":{\"from\":\"%s\",\"to\":\"%s\"}}",
-                        domain, vendor, technology, dataLevel, granularity,
-                        toJsonArray(requestedKpiCodes), from, to);
-                log.info("Fetching PM data (all nodes) via POST /pm/data/query/enriched");
-                raw = restClient.post()
-                        .uri("/pm/data/query/enriched")
-                        .header("Content-Type", "application/json")
-                        .body(body)
-                        .retrieve()
-                        .body(String.class);
-                responses = objectMapper.readValue(raw,
-                        objectMapper.getTypeFactory().constructCollectionType(
-                                List.class, org.springaicommunity.nova.pm.dto.PmDataEnrichedResponse.class));
+                if (unfilteredAllCombos) {
+                    List<DomainVendorTech> combos = fetchSupportedDomainVendorTechCombos(5000);
+                    if (combos.isEmpty()) {
+                        return "[PmAnalysis] No (domain/vendor/technology) combinations found in KPI metadata. "
+                                + "Cannot run an unfiltered PM query.";
+                    }
+                    log.info("Fetching PM data (unfiltered): {} domain/vendor/technology combos via POST /pm/data/query/enriched",
+                            combos.size());
+                    responses = new ArrayList<>();
+                    raw = "";
+                    for (DomainVendorTech c : combos) {
+                        String body = buildEnrichedQueryBody(
+                                c.domain(), c.vendor(), c.technology(),
+                                dataLevel, granularity, requestedKpiCodes, from, to);
+                        String comboRaw = restClient.post()
+                                .uri("/pm/data/query/enriched")
+                                .header("Content-Type", "application/json")
+                                .body(body)
+                                .retrieve()
+                                .body(String.class);
+                        List<org.springaicommunity.nova.pm.dto.PmDataEnrichedResponse> comboResponses =
+                                objectMapper.readValue(comboRaw,
+                                        objectMapper.getTypeFactory().constructCollectionType(
+                                                List.class, org.springaicommunity.nova.pm.dto.PmDataEnrichedResponse.class));
+                        if (comboResponses != null && !comboResponses.isEmpty()) {
+                            responses.addAll(comboResponses);
+                        }
+                    }
+                } else {
+                    String body = buildEnrichedQueryBody(domain, vendor, technology, dataLevel, granularity,
+                            requestedKpiCodes, from, to);
+                    log.info("Fetching PM data (all nodes) via POST /pm/data/query/enriched");
+                    raw = restClient.post()
+                            .uri("/pm/data/query/enriched")
+                            .header("Content-Type", "application/json")
+                            .body(body)
+                            .retrieve()
+                            .body(String.class);
+                    responses = objectMapper.readValue(raw,
+                            objectMapper.getTypeFactory().constructCollectionType(
+                                    List.class, org.springaicommunity.nova.pm.dto.PmDataEnrichedResponse.class));
+                }
             }
 
             System.out.println();
             System.out.println("┌─ PM API RAW RESPONSE " + "─".repeat(46));
-            System.out.println(raw);
+            if (unfilteredAllCombos) {
+                System.out.println("[unfiltered all-combos query] totalNodes=" + (responses == null ? 0 : responses.size()));
+            } else {
+                System.out.println(raw);
+            }
             System.out.println("└" + "─".repeat(68));
 
             if (responses == null || responses.isEmpty()) {
                 return "[PmAnalysis] No PM data found for the given parameters.";
             }
 
-            if (!requestedKpiTerms.isEmpty() && requestedKpiCodes.isEmpty()) {
+            if (!unfilteredAllCombos && !requestedKpiTerms.isEmpty() && requestedKpiCodes.isEmpty()) {
                 return "token_usage_total_estimated=0\nI couldn’t find KPI metadata matching your requested KPI scope. Please share the exact KPI name/code.";
             }
 
             raw = objectMapper.writeValueAsString(singleNode ? responses.get(0) : responses);
+            log.info("========pm_data_input start=========\n{}\n========pm_data_input end=========", raw);
 
             // ── Step 2: Token-budget decision ─────────────────────────────────────
             // Estimate tokens using the standard GPT approximation (1 token ≈ 4 chars).
@@ -271,10 +291,18 @@ public class PmDataFetchTool {
                             s.getNode(), s.getHealth(), s.getPerformanceScore(),
                             s.getAnomalies() != null ? s.getAnomalies().size() : 0);
                 }
-                String summaryJson = objectMapper.writeValueAsString(
-                        summaries.size() == 1 ? summaries.get(0) : summaries);
-                log.info("Analytics summary: {} chars (~{} tokens)",
-                        summaryJson.length(), summaryJson.length() / 4);
+                Object summaryPayload = (summaries.size() == 1 ? summaries.get(0) : summaries);
+                String summaryJson = objectMapper.writeValueAsString(summaryPayload);
+                int summaryTokens = summaryJson.length() / 4;
+                log.info("Analytics summary: {} chars (~{} tokens) nodes={}",
+                        summaryJson.length(), summaryTokens, summaries.size());
+
+                if (summaryTokens > MAX_LLM_INPUT_TOKENS_ESTIMATE) {
+                    Object reduced = reduceForLlm(summaries, DEFAULT_TOP_N_NODES_FOR_LLM, DEFAULT_TOP_N_ANOMALIES_FOR_LLM);
+                    summaryJson = objectMapper.writeValueAsString(reduced);
+                    log.info("Reduced analytics summary for LLM: {} chars (~{} tokens)",
+                            summaryJson.length(), summaryJson.length() / 4);
+                }
                 prompt = String.format("""
                         Investigation context: %s
                         User PM request: %s
@@ -285,9 +313,9 @@ public class PmDataFetchTool {
 
                         If response mode is REPORT, generate a formal structured NOC report.
                         If response mode is CONVERSATIONAL, respond like a friendly senior NOC engineer:
-                        - short actionable explanation
-                        - call out important KPI risks in plain operational language
-                        - suggest practical next checks/steps
+                        - provide enough detail to act without follow-up questions
+                        - include a short "What I see" plus "Next checks" bullet list (5-8 items)
+                        - call out KPI risks/trends with the numbers that are present
                         - avoid rigid report sections/headings unless explicitly asked
                         """, reportContext, originalUserQuery.isBlank() ? "(not provided)" : originalUserQuery, responseMode, summaryJson);
             // }
@@ -311,6 +339,7 @@ public class PmDataFetchTool {
         System.out.println("┌─ PmAnalyst INPUT " + "─".repeat(50));
         System.out.println(prompt);
         System.out.println("└" + "─".repeat(68));
+        log.info("========input start=========\n{}\n========input end=========", prompt);
 
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
@@ -328,7 +357,8 @@ public class PmDataFetchTool {
                 if ((!isRateLimit && !isOverCapacity) || attempt == MAX_RETRIES) {
                     throw e;
                 }
-                int wait = isOverCapacity ? Math.max(waitSeconds * 2, 30) : waitSeconds;
+                int hintedWait = extractRetryAfterSeconds(msg);
+                int wait = hintedWait > 0 ? hintedWait : (isOverCapacity ? Math.max(waitSeconds * 2, 30) : waitSeconds);
                 log.warn("[PmAnalysis] {} — waiting {}s before retry {}/{}",
                         isOverCapacity ? "Over capacity" : "Rate limited", wait, attempt, MAX_RETRIES);
                 try { Thread.sleep(wait * 1000L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
@@ -338,33 +368,196 @@ public class PmDataFetchTool {
         throw new IllegalStateException("Rate limit not resolved after " + MAX_RETRIES + " retries");
     }
 
+    private static int extractRetryAfterSeconds(String msg) {
+        if (msg == null || msg.isBlank()) return -1;
+        // Matches: "Please try again in 4.4112s"
+        var m = Pattern.compile("try again in\\s+([0-9]+(?:\\.[0-9]+)?)s", Pattern.CASE_INSENSITIVE).matcher(msg);
+        if (!m.find()) return -1;
+        try {
+            double seconds = Double.parseDouble(m.group(1));
+            return (int) Math.ceil(seconds) + 1; // add 1s buffer
+        } catch (Exception ignore) {
+            return -1;
+        }
+    }
+
+    private static Object reduceForLlm(List<org.springaicommunity.nova.pm.analytics.PmNodeSummary> summaries,
+            int topNodes, int topAnomalies) {
+        if (summaries == null || summaries.isEmpty()) return List.of();
+
+        // Health counts
+        Map<String, Long> healthCounts = summaries.stream()
+                .collect(Collectors.groupingBy(s -> String.valueOf(s.getHealth()), Collectors.counting()));
+
+        // Worst nodes by score (then by anomaly count)
+        List<org.springaicommunity.nova.pm.analytics.PmNodeSummary> worstNodes = summaries.stream()
+                .sorted(Comparator
+                        .comparingInt(org.springaicommunity.nova.pm.analytics.PmNodeSummary::getPerformanceScore)
+                        .thenComparingInt(s -> s.getAnomalies() == null ? 0 : -s.getAnomalies().size()))
+                .limit(Math.max(1, topNodes))
+                .toList();
+
+        // Flatten anomalies and keep most severe / highest deviation
+        record FlatA(String node, String domain, String vendor, String technology,
+                     org.springaicommunity.nova.pm.analytics.PmNodeSummary.KpiAnomaly a) {}
+
+        List<Map<String, Object>> topA = summaries.stream()
+                .flatMap(s -> (s.getAnomalies() == null ? List.<org.springaicommunity.nova.pm.analytics.PmNodeSummary.KpiAnomaly>of() : s.getAnomalies())
+                        .stream()
+                        .map(a -> new FlatA(s.getNode(), s.getDomain(), s.getVendor(), s.getTechnology(), a)))
+                .sorted(Comparator
+                        .comparing((FlatA x) -> severityRank(x.a().getSeverity())).reversed()
+                        .thenComparingDouble((FlatA x) -> x.a().getDeviationPct()).reversed())
+                .limit(Math.max(1, topAnomalies))
+                .map(x -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("node", x.node());
+                    m.put("domain", x.domain());
+                    m.put("vendor", x.vendor());
+                    m.put("technology", x.technology());
+                    m.put("kpiCode", x.a().getKpiCode());
+                    m.put("kpiName", x.a().getKpiName());
+                    m.put("severity", x.a().getSeverity());
+                    m.put("type", x.a().getType());
+                    m.put("deviationPct", x.a().getDeviationPct());
+                    m.put("mean", x.a().getMean());
+                    m.put("peak", x.a().getPeak());
+                    m.put("detectedAt", x.a().getDetectedAt());
+                    m.put("trend", x.a().getTrend());
+                    return m;
+                })
+                .toList();
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("nodesTotal", summaries.size());
+        out.put("healthCounts", healthCounts);
+        out.put("worstNodesTop", worstNodes);
+        out.put("topAnomalies", topA);
+        out.put("topThresholdBreaches", summaries.stream()
+                .flatMap(s -> {
+                    List<org.springaicommunity.nova.pm.analytics.PmNodeSummary.KpiThresholdBreach> breaches =
+                            (s.getThresholdBreaches() == null)
+                                    ? List.of()
+                                    : s.getThresholdBreaches();
+                    return breaches.stream().map(b -> {
+                        Map<String, Object> m = new LinkedHashMap<>();
+                        m.put("node", s.getNode());
+                        m.put("domain", s.getDomain());
+                        m.put("vendor", s.getVendor());
+                        m.put("technology", s.getTechnology());
+                        m.put("kpiCode", b.getKpiCode());
+                        m.put("kpiName", b.getKpiName());
+                        m.put("severity", b.getSeverity());
+                        m.put("thresholdType", b.getThresholdType());
+                        m.put("actualValue", b.getActualValue());
+                        m.put("thresholdValue", b.getThresholdValue());
+                        m.put("deviationPct", b.getDeviationPct());
+                        m.put("detectedAt", b.getDetectedAt());
+                        m.put("trend", b.getTrend());
+                        return m;
+                    });
+                })
+                .sorted(Comparator
+                        .comparing((Map<String, Object> m) -> String.valueOf(m.get("severity"))).reversed()
+                        .thenComparingDouble(m -> {
+                            Object v = m.get("deviationPct");
+                            return v instanceof Number n ? n.doubleValue() : 0.0;
+                        }).reversed())
+                .limit(200)
+                .toList());
+        out.put("note", "Reduced summary to fit LLM token budget; raw data was analyzed in Java across all nodes.");
+        return out;
+    }
+
+    private static int severityRank(org.springaicommunity.nova.pm.analytics.PmNodeSummary.KpiAnomaly.Severity s) {
+        if (s == null) return 0;
+        return switch (s) {
+            case LOW -> 1;
+            case MEDIUM -> 2;
+            case HIGH -> 3;
+            case CRITICAL -> 4;
+        };
+    }
+
+    private static String buildEnrichedQueryBody(String domain, String vendor, String technology,
+            String dataLevel, String granularity, Set<String> requestedKpiCodes, String from, String to) {
+        return String.format(
+                "{\"domain\":\"%s\",\"vendor\":\"%s\",\"technology\":\"%s\","
+                + "\"dataLevel\":\"%s\",\"granularity\":\"%s\",\"kpiCodes\":%s,"
+                + "\"timeRange\":{\"from\":\"%s\",\"to\":\"%s\"}}",
+                jsonEscape(domain), jsonEscape(vendor), jsonEscape(technology), jsonEscape(dataLevel),
+                jsonEscape(granularity), toJsonArray(requestedKpiCodes), jsonEscape(from), jsonEscape(to));
+    }
+
+    private List<DomainVendorTech> fetchSupportedDomainVendorTechCombos(int maxRows) {
+        if (this.dataSource == null) return List.of();
+        int limit = Math.max(1, maxRows);
+        String sql = "SELECT DISTINCT DOMAIN, VENDOR, TECHNOLOGY FROM KPI_FORMULA "
+                + "WHERE (DELETED = 0 OR DELETED IS NULL) "
+                + "AND DOMAIN IS NOT NULL AND TRIM(DOMAIN) <> '' "
+                + "AND VENDOR IS NOT NULL AND TRIM(VENDOR) <> '' "
+                + "AND TECHNOLOGY IS NOT NULL AND TRIM(TECHNOLOGY) <> '' "
+                + "LIMIT " + limit;
+        List<DomainVendorTech> out = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+                java.sql.Statement st = conn.createStatement();
+                ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                String d = rs.getString(1);
+                String v = rs.getString(2);
+                String t = rs.getString(3);
+                if (!isBlank(d) && !isBlank(v) && !isBlank(t)) {
+                    out.add(new DomainVendorTech(d.trim(), v.trim(), t.trim()));
+                }
+            }
+        }
+        catch (SQLException e) {
+            log.warn("[PmAnalysis] Failed to discover domain/vendor/technology combos from KPI_FORMULA: {}", e.getMessage());
+            return List.of();
+        }
+        return List.copyOf(out);
+    }
+
+    private record DomainVendorTech(String domain, String vendor, String technology) {}
+
+    private static String jsonEscape(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
     /**
      * Fills blanks so the orchestrator model can call PmAnalysis with no arguments
      * for generic "show performance report" requests.
      */
     private ResolvedPmParams resolveParams(String domain, String vendor, String technology,
             String dataLevel, String nodeName, String granularity, String from, String to, String userQuery) {
-        String d = blankToDefault(domain, DEFAULT_DOMAIN);
-        String v = blankToDefault(vendor, DEFAULT_VENDOR);
-        String t = blankToDefault(technology, DEFAULT_TECHNOLOGY);
-        String dl = blankToDefault(dataLevel, DEFAULT_DATA_LEVEL);
         String nn = nodeName != null ? nodeName.trim() : "";
+        String dl = blankToDefault(dataLevel, DEFAULT_DATA_LEVEL);
         String g = blankToDefault(granularity, DEFAULT_GRANULARITY).toUpperCase();
         String fromIso = blankToDefault(from, DEFAULT_FROM);
         String toIso = blankToDefault(to, DEFAULT_TO);
 
         String vendorFromQuery = extractVendorFromUserQuery(userQuery);
-        if (isBlank(vendor) && vendorFromQuery != null && !vendorFromQuery.isBlank()) {
-            v = vendorFromQuery;
-            log.info("[PmAnalysis] Vendor override from userQuery: vendor={}", v);
-        }
-
         ScopeResolution scope = resolveScopeFromUserQuery(userQuery);
         if (isBlank(dataLevel) && scope.dataLevel != null) {
             dl = scope.dataLevel;
         }
         if (isBlank(nodeName) && scope.nodeName != null && !scope.nodeName.isBlank()) {
             nn = scope.nodeName;
+        }
+
+        // Decide whether the user truly requested an "unfiltered" query (all domain/vendor/technology combos).
+        // If scope resolution produced a nodeName (e.g. CITY=Hyderabad), this is not an unfiltered query and
+        // we should apply the normal defaults for domain/vendor/technology.
+        boolean unfilteredAllCombos = isBlank(domain) && isBlank(vendor) && isBlank(technology) && nn.isBlank();
+
+        String d = unfilteredAllCombos ? "" : blankToDefault(domain, DEFAULT_DOMAIN);
+        String v = unfilteredAllCombos ? "" : blankToDefault(vendor, DEFAULT_VENDOR);
+        String t = unfilteredAllCombos ? "" : blankToDefault(technology, DEFAULT_TECHNOLOGY);
+
+        if (isBlank(vendor) && vendorFromQuery != null && !vendorFromQuery.isBlank() && !unfilteredAllCombos) {
+            v = vendorFromQuery;
+            log.info("[PmAnalysis] Vendor override from userQuery: vendor={}", v);
         }
 
         if (!scope.reason.isBlank()) {

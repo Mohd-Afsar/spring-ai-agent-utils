@@ -42,6 +42,19 @@ public class PmNodeSummary {
     /** Detected anomalies — only KPIs that breached a threshold. */
     private List<KpiAnomaly> anomalies;
 
+    /**
+     * Explicit SLA threshold breaches with both actual and threshold values.
+     * This exists so the LLM can render the "KPI Threshold Breaches" section
+     * without inferring thresholds from other fields.
+     */
+    private List<KpiThresholdBreach> thresholdBreaches;
+
+    /**
+     * Window statistics per KPI (latest/mean/min/max/p95) to support degradation
+     * and benchmarking-style comparisons when external baselines are not available.
+     */
+    private List<KpiWindowStat> kpiWindowStats;
+
     /** Top-3 busiest time points. */
     private List<String> busiestPeriods;
 
@@ -121,6 +134,68 @@ public class PmNodeSummary {
         public void setTrend(String trend) { this.trend = trend; }
     }
 
+    public static class KpiThresholdBreach {
+        private String kpiCode;
+        private String kpiName;
+        private double actualValue;
+        private double thresholdValue;
+        private String thresholdType; // e.g. CRIT_HIGH, WARN_LOW
+        private double deviationPct;
+        private String detectedAt;
+        private String trend;
+        private KpiAnomaly.Severity severity;
+
+        public String getKpiCode() { return kpiCode; }
+        public void setKpiCode(String kpiCode) { this.kpiCode = kpiCode; }
+        public String getKpiName() { return kpiName; }
+        public void setKpiName(String kpiName) { this.kpiName = kpiName; }
+        public double getActualValue() { return actualValue; }
+        public void setActualValue(double actualValue) { this.actualValue = actualValue; }
+        public double getThresholdValue() { return thresholdValue; }
+        public void setThresholdValue(double thresholdValue) { this.thresholdValue = thresholdValue; }
+        public String getThresholdType() { return thresholdType; }
+        public void setThresholdType(String thresholdType) { this.thresholdType = thresholdType; }
+        public double getDeviationPct() { return deviationPct; }
+        public void setDeviationPct(double deviationPct) { this.deviationPct = deviationPct; }
+        public String getDetectedAt() { return detectedAt; }
+        public void setDetectedAt(String detectedAt) { this.detectedAt = detectedAt; }
+        public String getTrend() { return trend; }
+        public void setTrend(String trend) { this.trend = trend; }
+        public KpiAnomaly.Severity getSeverity() { return severity; }
+        public void setSeverity(KpiAnomaly.Severity severity) { this.severity = severity; }
+    }
+
+    public static class KpiWindowStat {
+        private String kpiCode;
+        private String kpiName;
+        private int samples;
+        private double latest;
+        private double mean;
+        private double min;
+        private double max;
+        private double p95;
+        private String trend;
+
+        public String getKpiCode() { return kpiCode; }
+        public void setKpiCode(String kpiCode) { this.kpiCode = kpiCode; }
+        public String getKpiName() { return kpiName; }
+        public void setKpiName(String kpiName) { this.kpiName = kpiName; }
+        public int getSamples() { return samples; }
+        public void setSamples(int samples) { this.samples = samples; }
+        public double getLatest() { return latest; }
+        public void setLatest(double latest) { this.latest = latest; }
+        public double getMean() { return mean; }
+        public void setMean(double mean) { this.mean = mean; }
+        public double getMin() { return min; }
+        public void setMin(double min) { this.min = min; }
+        public double getMax() { return max; }
+        public void setMax(double max) { this.max = max; }
+        public double getP95() { return p95; }
+        public void setP95(double p95) { this.p95 = p95; }
+        public String getTrend() { return trend; }
+        public void setTrend(String trend) { this.trend = trend; }
+    }
+
     // -------------------------------------------------------------------------
     // Getters / setters
     // -------------------------------------------------------------------------
@@ -153,6 +228,10 @@ public class PmNodeSummary {
     public void setDimensionScores(DimensionScores dimensionScores) { this.dimensionScores = dimensionScores; }
     public List<KpiAnomaly> getAnomalies() { return anomalies; }
     public void setAnomalies(List<KpiAnomaly> anomalies) { this.anomalies = anomalies; }
+    public List<KpiThresholdBreach> getThresholdBreaches() { return thresholdBreaches; }
+    public void setThresholdBreaches(List<KpiThresholdBreach> thresholdBreaches) { this.thresholdBreaches = thresholdBreaches; }
+    public List<KpiWindowStat> getKpiWindowStats() { return kpiWindowStats; }
+    public void setKpiWindowStats(List<KpiWindowStat> kpiWindowStats) { this.kpiWindowStats = kpiWindowStats; }
     public List<String> getBusiestPeriods() { return busiestPeriods; }
     public void setBusiestPeriods(List<String> busiestPeriods) { this.busiestPeriods = busiestPeriods; }
     public List<String> getFindings() { return findings; }

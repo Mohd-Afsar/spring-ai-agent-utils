@@ -12,12 +12,15 @@ import org.springaicommunity.nova.pm.analytics.PmNodeSummary.DimensionScores;
 import org.springaicommunity.nova.pm.analytics.PmNodeSummary.HealthStatus;
 import org.springaicommunity.nova.pm.analytics.PmNodeSummary.KpiAnomaly;
 import org.springaicommunity.nova.pm.analytics.PmNodeSummary.KpiAnomaly.Severity;
+import org.springaicommunity.nova.pm.analytics.PmNodeSummary.KpiThresholdBreach;
+import org.springaicommunity.nova.pm.analytics.PmNodeSummary.KpiWindowStat;
 import org.springaicommunity.nova.pm.dto.KpiFormulaDetails;
 import org.springaicommunity.nova.pm.dto.PmDataCompactResponse;
 import org.springaicommunity.nova.pm.dto.PmDataCompactResponse.DataEntry;
 import org.springaicommunity.nova.pm.dto.PmDataEnrichedResponse;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
+import java.util.Arrays;
 
 /**
  * Telecom-grade PM analytics engine.
@@ -126,20 +129,25 @@ public class PmAnalyticsEngine {
 
         // ── Anomaly detection ─────────────────────────────────────────────────
         List<KpiAnomaly> anomalies = new ArrayList<>();
+        List<KpiThresholdBreach> thresholdBreaches = new ArrayList<>();
+        List<KpiWindowStat> windowStats = new ArrayList<>();
         for (Map.Entry<String, double[]> e : seriesMap.entrySet()) {
             String code = e.getKey();
             double[] values = e.getValue();
             String kpiName = kpiName(code, kpiDetails);
             String trend = trend(values);
+            windowStats.add(windowStat(code, kpiName, values, trend));
             detectAnomalies(code, kpiName, values, data, anomalies, trend);
             slaRegistry.bandForKpi(code).ifPresent(band ->
-                    detectThresholdBreaches(code, kpiName, values, data, trend, band, anomalies));
+                    detectThresholdBreaches(code, kpiName, values, data, trend, band, anomalies, thresholdBreaches));
         }
         // Sort: CRITICAL first, then by deviation descending
         anomalies.sort(Comparator
                 .comparingInt((KpiAnomaly a) -> -a.getSeverity().ordinal())
                 .thenComparingDouble(a -> -Math.abs(a.getDeviationPct())));
         summary.setAnomalies(anomalies);
+        summary.setThresholdBreaches(thresholdBreaches);
+        summary.setKpiWindowStats(windowStats);
 
         // ── Busiest periods ───────────────────────────────────────────────────
         summary.setBusiestPeriods(topBusiestPeriods(data, 3));
@@ -270,7 +278,7 @@ public class PmAnalyticsEngine {
      * One worst SLA breach per KPI (highest severity, then largest margin past the band).
      */
     private void detectThresholdBreaches(String code, String kpiName, double[] values, List<DataEntry> data,
-            String trend, KpiSlaBand band, List<KpiAnomaly> out) {
+            String trend, KpiSlaBand band, List<KpiAnomaly> out, List<KpiThresholdBreach> breachOut) {
         ThresholdPick best = null;
         for (int i = 0; i < values.length; i++) {
             if (!isFinite(values[i])) {
@@ -284,26 +292,27 @@ public class PmAnalyticsEngine {
         if (best != null) {
             out.add(thresholdAnomaly(code, kpiName, best.actual(), best.limit(), best.highSide(), best.severity(),
                     data.get(best.idx()).getTime(), trend));
+            breachOut.add(thresholdBreach(code, kpiName, best, data.get(best.idx()).getTime(), trend));
         }
     }
 
     private ThresholdPick evalThresholdAt(double v, KpiSlaBand band, int idx) {
         if (band.getCritHigh() != null && v > band.getCritHigh()) {
-            return new ThresholdPick(idx, v, band.getCritHigh(), true, Severity.CRITICAL);
+            return new ThresholdPick(idx, v, band.getCritHigh(), true, Severity.CRITICAL, "CRIT_HIGH");
         }
         if (band.getCritLow() != null && v < band.getCritLow()) {
-            return new ThresholdPick(idx, v, band.getCritLow(), false, Severity.CRITICAL);
+            return new ThresholdPick(idx, v, band.getCritLow(), false, Severity.CRITICAL, "CRIT_LOW");
         }
         if (band.getWarnHigh() != null && v > band.getWarnHigh()) {
-            return new ThresholdPick(idx, v, band.getWarnHigh(), true, Severity.HIGH);
+            return new ThresholdPick(idx, v, band.getWarnHigh(), true, Severity.HIGH, "WARN_HIGH");
         }
         if (band.getWarnLow() != null && v < band.getWarnLow()) {
-            return new ThresholdPick(idx, v, band.getWarnLow(), false, Severity.HIGH);
+            return new ThresholdPick(idx, v, band.getWarnLow(), false, Severity.HIGH, "WARN_LOW");
         }
         return null;
     }
 
-    private record ThresholdPick(int idx, double actual, double limit, boolean highSide, Severity severity) {
+    private record ThresholdPick(int idx, double actual, double limit, boolean highSide, Severity severity, String thresholdType) {
         double excessPastLimit() {
             return highSide ? actual - limit : limit - actual;
         }
@@ -334,6 +343,63 @@ public class PmAnalyticsEngine {
         a.setDetectedAt(detectedAt);
         a.setTrend(trend);
         return a;
+    }
+
+    private KpiThresholdBreach thresholdBreach(String code, String name, ThresholdPick pick, String detectedAt, String trend) {
+        KpiThresholdBreach b = new KpiThresholdBreach();
+        b.setKpiCode(code);
+        b.setKpiName(name);
+        b.setActualValue(round2(pick.actual()));
+        b.setThresholdValue(round2(pick.limit()));
+        b.setThresholdType(pick.thresholdType());
+        if (pick.limit() != 0 && Double.isFinite(pick.limit())) {
+            b.setDeviationPct(round2(((pick.actual() - pick.limit()) / Math.abs(pick.limit())) * 100));
+        } else {
+            b.setDeviationPct(pick.actual() > pick.limit() ? 100 : (pick.actual() < pick.limit() ? -100 : 0));
+        }
+        b.setDetectedAt(detectedAt);
+        b.setTrend(trend);
+        b.setSeverity(pick.severity());
+        return b;
+    }
+
+    private static KpiWindowStat windowStat(String code, String name, double[] values, String trend) {
+        KpiWindowStat s = new KpiWindowStat();
+        s.setKpiCode(code);
+        s.setKpiName(name);
+        int samples = countFinite(values);
+        s.setSamples(samples);
+        s.setTrend(trend);
+        if (samples == 0) {
+            s.setLatest(Double.NaN);
+            s.setMean(Double.NaN);
+            s.setMin(Double.NaN);
+            s.setMax(Double.NaN);
+            s.setP95(Double.NaN);
+            return s;
+        }
+        s.setLatest(round2(latestFinite(values)));
+        s.setMean(round2(meanValid(values)));
+        s.setMin(round2(minValid(values)));
+        s.setMax(round2(maxValid(values)));
+        s.setP95(round2(p95Valid(values)));
+        return s;
+    }
+
+    private static double latestFinite(double[] values) {
+        for (int i = values.length - 1; i >= 0; i--) {
+            if (isFinite(values[i])) return values[i];
+        }
+        return Double.NaN;
+    }
+
+    private static double p95Valid(double[] values) {
+        double[] finite = Arrays.stream(values).filter(PmAnalyticsEngine::isFinite).toArray();
+        if (finite.length == 0) return Double.NaN;
+        Arrays.sort(finite);
+        int idx = (int) Math.ceil(0.95 * finite.length) - 1;
+        idx = Math.max(0, Math.min(finite.length - 1, idx));
+        return finite[idx];
     }
 
     private KpiAnomaly anomaly(String code, String name, double mean, double actual,
@@ -579,6 +645,20 @@ public class PmAnalyticsEngine {
         return any ? m : Double.NaN;
     }
 
+    private static double minValid(double[] v) {
+        double m = Double.POSITIVE_INFINITY;
+        boolean any = false;
+        for (double x : v) {
+            if (isFinite(x)) {
+                any = true;
+                if (x < m) {
+                    m = x;
+                }
+            }
+        }
+        return any ? m : Double.NaN;
+    }
+
     private String trend(double[] v) {
         double[] valid = finiteValues(v);
         if (valid.length < 2) {
@@ -661,7 +741,7 @@ public class PmAnalyticsEngine {
         return d != null && d.getKpiName() != null ? d.getKpiName() : code;
     }
 
-    private double round2(double v) {
+    private static double round2(double v) {
         return Math.round(v * 100.0) / 100.0;
     }
 
